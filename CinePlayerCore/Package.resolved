@@ -1,0 +1,15 @@
+{
+  "originHash" : "f4dc5b1496322585434a11cc48002d35b3b82447fee3727f0ce6269d9315fa63",
+  "pins" : [
+    {
+      "identity" : "cinekit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/ryanjohnsontv/CineKit.git",
+      "state" : {
+        "revision" : "9a05c65c4996661a898f27cabf44918c6994339e",
+        "version" : "0.1.0"
+      }
+    }
+  ],
+  "version" : 3
+}

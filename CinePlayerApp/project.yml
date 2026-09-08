@@ -1,0 +1,342 @@
+name: CinePlayer
+options:
+  bundleIdPrefix: com.cineplayer
+  deploymentTarget:
+    macOS: "26.0"
+  createIntermediateGroups: true
+
+# Local Swift Package dependency on ../CinePlayerCore (relative to this
+# directory) — the core SwiftUI/Metal library package, named
+# "CinePlayerCore" in both its folder and its own Package.swift, kept
+# deliberately distinct from this app target's own "CinePlayer" name (see
+# the target below) so the two are never confused for each other. We only
+# need to link the CinePlayerCore product — its own Package.swift already
+# depends on ../CineKit, so CineKit comes along transitively, the same way
+# it does for cine-diagnostic/cine-scrub-bench.
+packages:
+  CinePlayerCore:
+    path: ../CinePlayerCore
+
+targets:
+  CinePlayer:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      # Deliberately NOT renamed to match the target above — this points
+      # at the physical CinePlayerApp/CinePlayerApp/ source directory.
+      # Moving it would touch every file inside (Views/, Support/,
+      # Shaders/) for a purely cosmetic gain, so it's left as-is; the
+      # product/target/scheme name is what the user actually sees.
+      - path: CinePlayerApp
+    # Switched from GENERATE_INFOPLIST_FILE: YES (a flat INFOPLIST_KEY_*-only
+    # mechanism that can't express a nested array-of-dicts key like
+    # UTExportedTypeDeclarations) to an explicit generated Info.plist —
+    # xcodegen writes CinePlayerApp/Info.plist itself from `properties`
+    # below and points INFOPLIST_FILE at it; it also auto-populates
+    # CFBundleIdentifier/CFBundleExecutable/CFBundleName/
+    # CFBundleDevelopmentRegion/CFBundleInfoDictionaryVersion/
+    # CFBundlePackageType "if appropriate" (its own documented behavior),
+    # the same baseline GENERATE_INFOPLIST_FILE: YES was already producing —
+    # confirmed by diffing the actual built app's Info.plist before/after
+    # this change; only the added UTExportedTypeDeclarations entry (and the
+    # literal, still-empty NSHumanReadableCopyright, kept only for parity —
+    # Xcode already omitted it outright since GENERATE_INFOPLIST_FILE
+    # silently drops empty-string keys) are new.
+    #
+    # UTExportedTypeDeclarations: `.cine` files had no real declared UTI
+    # before this — `CinePlayerApp.swift`'s `openFile()` calling
+    # `UTType(filenameExtension: "cine")` only ever got the system's ad-hoc
+    # dynamic fallback (an unstable `dyn.###...` identifier conforming to
+    # nothing but public.data), since nothing on the system exported a real
+    # type for that extension. Declaring one here fixes that for the main
+    # app's own file-open panel too (an incidental improvement, not just
+    # infrastructure for Quick Look) and is required for Quick Look at all:
+    # both extensions' own `QLSupportedContentTypes` need a real, stable UTI
+    # to match against, not a dynamic one that could differ from run to run.
+    #
+    # Conforms to public.data, not public.movie. This was originally set to
+    # public.movie (a .cine file fundamentally *is* an image sequence played
+    # back at a frame rate, matching how Vision Research's own real-world
+    # macOS tooling, the "Phantom Cine Toolkit," treats the format) — but
+    # confirmed live 2026-08-14: conforming to public.movie makes Finder's
+    # Quick Look panel present real movie-file chrome (an "Open with
+    # QuickTime Player" button), which is a genuinely false promise for us
+    # specifically. The Phantom Cine Toolkit could back that promise because
+    # it ships an actual QuickTime *component* — QuickTime Player itself can
+    # play a .cine through it. This app has no such component: clicking that
+    # button launches QuickTime Player, which then hard-errors ("isn't
+    # compatible with QuickTime Player"). public.data makes no playability
+    # claim either way, matching what CinePreviewImage/the two Quick Look
+    # extensions actually deliver today (one static rendered frame, not
+    # scrubbable or playable) — public.image was considered and rejected
+    # too, since a .cine is a sequence, not a single still. Revisit this
+    # back to something richer if a real animated/playable Quick Look
+    # preview is ever built (a legitimate, but substantial, follow-on
+    # feature — see project memory).
+    info:
+      path: CinePlayerApp/Info.plist
+      properties:
+        NSHumanReadableCopyright: ""
+        UTExportedTypeDeclarations:
+          - UTTypeIdentifier: com.cineplayer.cine
+            UTTypeDescription: "Phantom Cine Video"
+            UTTypeConformsTo:
+              - public.data
+            UTTypeTagSpecification:
+              public.filename-extension:
+                - cine
+    settings:
+      base:
+        PRODUCT_NAME: CinePlayer
+        PRODUCT_BUNDLE_IDENTIFIER: com.cineplayer.app
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        # Swift 6 language mode — matches the CinePlayerCore package's own
+        # swift-tools-version: 6.2 (Swift 6 mode, strict concurrency
+        # checking). Verified "6" (not "6.0"/"6.2") is the value this
+        # toolchain's Swift frontend actually accepts for -swift-version:
+        # `swiftc -swift-version 6.2 -typecheck ...` errors with "valid
+        # arguments to '-swift-version' are '4', '4.2', '5', '6'" — the
+        # language-mode setting is coarse-grained and independent of the
+        # finer-grained swift-tools-version used by SwiftPM manifests.
+        SWIFT_VERSION: "6"
+        # No paid Apple Developer team is configured on this machine.
+        # Leaving DEVELOPMENT_TEAM unset lets Xcode's modern signing
+        # machinery fall back to "Sign to Run Locally" automatically —
+        # hardcoding a team id here would break that.
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: CinePlayerApp/CinePlayer.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - package: CinePlayerCore
+        product: CinePlayerCore
+      # Embeds both Quick Look extensions' .appex bundles into
+      # CinePlayer.app/Contents/PlugIns/ — required for Finder/PluginKit to
+      # ever discover them at all; an extension only registers once its
+      # host app has actually been launched (see the two targets' own doc
+      # comments below for the local-testing workflow this implies).
+      - target: CineThumbnailExtension
+        embed: true
+      - target: CinePreviewExtension
+        embed: true
+    postbuildScripts:
+      - name: "Alias default.metallib as CinePlayerShaders.metallib"
+        # Xcode's native, built-in .metal compilation (the whole point of
+        # this migration — no MetalShaderPlugin involved for this target)
+        # always names its output "default.metallib", a fixed Xcode/Metal
+        # convention with no build-setting override. But CineRenderer (in
+        # CinePlayerCore, deliberately left unchanged so cine-diagnostic/
+        # cine-scrub-bench keep working) looks up a file specifically named
+        # "CinePlayerShaders.metallib" — that name only exists to dodge a
+        # *different* collision (see MetalShaderPlugin/plugin.swift) between
+        # the plugin's own output and this same Xcode auto-compilation, when
+        # both run against CinePlayerCore's package sources. Since we can't
+        # change that lookup, alias this target's own default.metallib under
+        # the name it expects. Runs as a postbuild script so it executes
+        # before Xcode's final, automatic code-signing step (not a
+        # separately orderable phase) — the copied file is present and gets
+        # signed/sealed along with everything else, not added after the fact.
+        script: |
+          set -e
+          RESOURCES="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          if [ -f "${RESOURCES}/default.metallib" ]; then
+            cp "${RESOURCES}/default.metallib" "${RESOURCES}/CinePlayerShaders.metallib"
+          fi
+        # Declared so Xcode can skip this phase when default.metallib hasn't
+        # changed since the last copy, instead of re-running it on every
+        # single build (its own doc comment above explains why the phase
+        # itself has to stay a postbuild script). Both paths matter here, not
+        # just the output: an output-only declaration would make Xcode treat
+        # the copy as satisfied forever after its first run, silently going
+        # stale the next time a shader edit recompiles default.metallib.
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/default.metallib
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/CinePlayerShaders.metallib
+
+  # --- Quick Look app extensions ---
+  #
+  # Both targets below are `type: app-extension` — xcodegen's real,
+  # supported product type for the modern (macOS 10.15+) QLThumbnailProvider
+  # /QLPreviewingController extension-point APIs used here, NOT the legacy
+  # pre-10.15 `.qlgenerator` plugin-bundle format (which macOS no longer
+  # loads at all as of Sequoia/26 — confirmed via research during this
+  # feature's implementation, not assumed). Verified against a real, shipped
+  # open-source project ("glb-preview" on GitHub) using this exact
+  # `type: app-extension` + `NSExtensionPointIdentifier: com.apple.quicklook.
+  # thumbnail`/`com.apple.quicklook.preview` shape with xcodegen, which is
+  # where this project.yml shape (and the local-testing workflow described
+  # below) is drawn from.
+  #
+  # Local testing/registration workflow (both extensions are only ever
+  # discovered by Finder/PluginKit through this path — there is no separate
+  # per-extension install step):
+  #   1. `xcodegen generate` (this file) then build the CinePlayer scheme —
+  #      building it also builds+embeds both extensions (see the `embed:
+  #      true` dependencies on the CinePlayer target above), since Xcode
+  #      treats an app target's embedded extensions as build dependencies.
+  #   2. PluginKit/LaunchServices only discover an app extension once its
+  #      HOST APP has actually been run at least once from a stable path —
+  #      NOT from inside Xcode's own DerivedData build folder, which
+  #      PluginKit deliberately ignores. Copy the built CinePlayer.app out
+  #      of DerivedData to a normal location (e.g. /Applications or
+  #      ~/Applications) and launch it (a plain `open` is enough — the app
+  #      doesn't need to stay running) before either extension will appear
+  #      to the system at all.
+  #   3. `pluginkit -m -v -i com.cineplayer.app.CineThumbnailExtension` (and
+  #      the `.CinePreviewExtension` counterpart) to confirm the system has
+  #      actually registered it.
+  #   4. `qlmanage -r` resets the quicklookd daemon so it picks up a freshly
+  #      (re)registered extension without a full logout/reboot.
+  #   5. `qlmanage -t -s 512 <file>.cine` / `qlmanage -p <file>.cine` to
+  #      actually exercise the thumbnail/preview extension against a real
+  #      sample file.
+  CineThumbnailExtension:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: CineThumbnailExtension
+      # Compiled directly into this target too (not referenced from
+      # CinePlayerCore's own Bundle.module) — same reason the main
+      # CinePlayer app target has its own copy: an Xcode-native target
+      # (this is a real .appex, its own process/bundle at runtime) has no
+      # SwiftPM Bundle.module of its own, so `CineRenderer` is constructed
+      # here with `bundle: Bundle.main` and needs *this* target's own
+      # compiled CinePlayerShaders.metallib to find. One physical file,
+      # deliberately given membership in 3 different Xcode targets
+      # (CinePlayer/CineThumbnailExtension/CinePreviewExtension) rather
+      # than 3 physical copies — a single canonical extension-friendly copy
+      # of the shader source, not a fresh duplicate per target.
+      - path: CinePlayerApp/Shaders/Tonemap.metal
+    info:
+      path: CineThumbnailExtension/Info.plist
+      properties:
+        CFBundleDisplayName: CinePlayer Thumbnail
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.quicklook.thumbnail
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).ThumbnailProvider"
+          NSExtensionAttributes:
+            QLSupportedContentTypes:
+              - com.cineplayer.cine
+            QLSupportsSearchableItems: false
+            # Present (as 0, i.e. "no minimum") in every real
+            # `com.apple.quicklook.thumbnail` provider's Info.plist found on
+            # this machine (via `lsregister -dump`) and in Xcode's own
+            # "Quick Look Thumbnail Extension" template — added for parity,
+            # not because omitting it was shown to cause the qlmanage -t
+            # hang investigated in ThumbnailProvider.swift's doc comment
+            # (that hang independently reproduces for Apple's own installed
+            # thumbnail extensions too, entirely unrelated to this key).
+            QLThumbnailMinimumDimension: 0
+    settings:
+      base:
+        PRODUCT_NAME: CineThumbnailExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.cineplayer.app.CineThumbnailExtension
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        SWIFT_VERSION: "6"
+        CODE_SIGN_STYLE: Automatic
+        # A plain build setting, NOT xcodegen's own `entitlements:` target
+        # property — that property regenerates/overwrites the file at its
+        # path from a `properties:` map on every `xcodegen generate`, which
+        # blanked out this hand-authored file the first time this was tried
+        # (see the file's own doc comment). Matches how the main CinePlayer
+        # target's own entitlements file is referenced.
+        CODE_SIGN_ENTITLEMENTS: CineThumbnailExtension/CineThumbnailExtension.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        # Extensions are never launched directly by anything but the
+        # system, and never need their own top-level Applications-folder
+        # install product — matches glb-preview's own extension targets.
+        SKIP_INSTALL: YES
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - package: CinePlayerCore
+        product: CinePlayerCore
+    # Identical to the CinePlayer app target's own postbuild script above —
+    # this target also compiles its own copy of Tonemap.metal directly
+    # (Xcode's native .metal compilation, not the MetalShaderPlugin), which
+    # also always names its output "default.metallib" in *this target's own*
+    # Resources folder. Without this alias, `CineRenderer(bundle: .main)`
+    # would fail with `.shaderLibraryNotFound` at runtime inside this
+    # extension specifically — confirmed missing and added after inspecting
+    # a real built .appex's Resources folder during this feature's
+    # verification pass.
+    postbuildScripts:
+      - name: "Alias default.metallib as CinePlayerShaders.metallib"
+        script: |
+          set -e
+          RESOURCES="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          if [ -f "${RESOURCES}/default.metallib" ]; then
+            cp "${RESOURCES}/default.metallib" "${RESOURCES}/CinePlayerShaders.metallib"
+          fi
+        # See the identical script phase on the CinePlayer app target above
+        # for why these are declared.
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/default.metallib
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/CinePlayerShaders.metallib
+
+  CinePreviewExtension:
+    type: app-extension
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: CinePreviewExtension
+      # Same reasoning as CineThumbnailExtension's identical entry above.
+      - path: CinePlayerApp/Shaders/Tonemap.metal
+    info:
+      path: CinePreviewExtension/Info.plist
+      properties:
+        CFBundleDisplayName: CinePlayer Preview
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.quicklook.preview
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).PreviewViewController"
+          NSExtensionAttributes:
+            QLSupportedContentTypes:
+              - com.cineplayer.cine
+            QLSupportsSearchableItems: false
+    settings:
+      base:
+        PRODUCT_NAME: CinePreviewExtension
+        PRODUCT_BUNDLE_IDENTIFIER: com.cineplayer.app.CinePreviewExtension
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
+        SWIFT_VERSION: "6"
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: CinePreviewExtension/CinePreviewExtension.entitlements
+        GENERATE_INFOPLIST_FILE: NO
+        SKIP_INSTALL: YES
+        ENABLE_HARDENED_RUNTIME: NO
+    dependencies:
+      - package: CinePlayerCore
+        product: CinePlayerCore
+    # See CineThumbnailExtension's identical postbuild script for why this
+    # is needed.
+    postbuildScripts:
+      - name: "Alias default.metallib as CinePlayerShaders.metallib"
+        script: |
+          set -e
+          RESOURCES="${BUILT_PRODUCTS_DIR}/${UNLOCALIZED_RESOURCES_FOLDER_PATH}"
+          if [ -f "${RESOURCES}/default.metallib" ]; then
+            cp "${RESOURCES}/default.metallib" "${RESOURCES}/CinePlayerShaders.metallib"
+          fi
+        # See the identical script phase on the CinePlayer app target above
+        # for why these are declared.
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/default.metallib
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/CinePlayerShaders.metallib
+
+schemes:
+  CinePlayer:
+    build:
+      targets:
+        CinePlayer: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+    analyze:
+      config: Debug
+    test:
+      config: Debug

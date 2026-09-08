@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.get-task-allow</key>
+    <true/>
+    <!--
+      An `com.apple.security.application-groups` entitlement was tried here
+      (2026-08-15) to share the Quick Look "customize the default playback
+      speed" preference with this app's own Settings window, so it could be
+      set in one place and read by the (mandatorily sandboxed) Quick Look
+      extension. Reverted: this machine has zero code-signing identities
+      configured (`security find-identity -v -p codesigning` returns none,
+      no Development Team) and Xcode refuses to build ANY target declaring
+      an app-group entitlement without one — "entitlements that require
+      signing with a development certificate." App groups need a real
+      (even free/Personal-Team) Apple ID signed into Xcode; ad-hoc "Sign to
+      Run Locally" alone isn't enough. Revisit if that's ever set up —
+      `QuickLookPlaybackPreferences` (CinePlayerCore) already has the
+      suite-name-based storage ready to go, just currently pointed at
+      `UserDefaults.standard` instead.
+    -->
+</dict>
+</plist>

@@ -1,0 +1,40 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Release
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build CinePlayer app (xcodebuild, Release)
+        working-directory: CinePlayerApp
+        run: >-
+          xcodebuild -project CinePlayer.xcodeproj -scheme CinePlayer
+          -configuration Release build
+          -derivedDataPath "${{ runner.temp }}/build"
+
+      - name: Package CinePlayer.app
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          APP_PATH="${{ runner.temp }}/build/Build/Products/Release/CinePlayer.app"
+          ZIP_NAME="CinePlayer-${TAG}.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$ZIP_NAME"
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: ${{ env.ZIP_NAME }}
+          generate_release_notes: true

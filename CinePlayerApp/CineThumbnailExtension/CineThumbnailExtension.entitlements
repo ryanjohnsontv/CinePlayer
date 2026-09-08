@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Quick Look app extensions must be sandboxed regardless of whether the
+      host app is (the main CinePlayer app deliberately is not — see
+      CinePlayerApp/CinePlayer.entitlements). This is NOT a copy of that
+      file: the host app's entitlements are a debug-only
+      `get-task-allow` and nothing else (it isn't sandboxed at all), which
+      would be meaningless/wrong here.
+
+      **Correction, 2026-08-13 — the previous version of this comment's
+      claim was wrong; keep the file-access entitlements below.** It had
+      claimed no file-access entitlement was needed, based on one
+      open-source reference project. Directly inspecting this machine's own
+      `lsregister -dump` output for every *currently installed, working*
+      `com.apple.quicklook.thumbnail` provider (Apple's own
+      HydraQLThumbnailExtension, SceneKitQLThumbnailExtension, etc. —
+      genuinely shipping, real examples on this exact macOS/Xcode version,
+      a stronger source than a single third-party sample) shows every one
+      of them declaring both entitlements below alongside app-sandbox. Not
+      proven to be the fix for this project's specific qlmanage -t hang
+      (see the `ThumbnailProvider.swift` investigation notes: that hang was
+      independently root-caused to a genuine environment/session-level
+      limitation of the com.apple.quicklook.thumbnail extension point's
+      dispatch mechanism, reproducing identically for Apple's own
+      HydraQLThumbnailExtension against an unrelated control file even with
+      these same entitlements already present — so this alone won't make
+      qlmanage succeed in that same constrained environment). Kept anyway
+      as a real, evidence-based parity fix with every working reference
+      example actually found on this system, and worth having regardless
+      once run somewhere the extension point's dispatch itself works.
+
+      Referenced directly via the CODE_SIGN_ENTITLEMENTS build setting in
+      project.yml (not xcodegen's own `entitlements:` target property,
+      which — confirmed the hard way — regenerates/overwrites this file
+      from a `properties:` map on every `xcodegen generate` and would blank
+      it out entirely if that map were left empty). This matches how the
+      main CinePlayer target's own CinePlayer.entitlements is already
+      referenced.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <key>com.apple.security.files.user-selected.read-only</key>
+    <true/>
+    <key>com.apple.security.files.downloads.read-only</key>
+    <true/>
+</dict>
+</plist>

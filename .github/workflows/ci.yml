@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: Build & Test
+    runs-on: macos-26
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Cache SwiftPM build state
+        uses: actions/cache@v6
+        with:
+          path: |
+            CinePlayerCore/.build
+          key: >-
+            swiftpm-${{ runner.os }}-${{
+              hashFiles('CinePlayerCore/Package.swift', 'CinePlayerCore/Package.resolved', 'CinePlayerCore/Sources/**', 'CinePlayerCore/Plugins/**')
+            }}
+          restore-keys: |
+            swiftpm-${{ runner.os }}-
+
+      - name: Install SwiftLint
+        run: brew install swiftlint
+
+      - name: Run SwiftLint
+        run: >-
+          swiftlint lint --config .swiftlint.yml
+          CinePlayerCore/Sources
+          CinePlayerApp/CinePlayerApp
+
+      - name: Build CinePlayerCore (swift build)
+        working-directory: CinePlayerCore
+        run: swift build
+
+      - name: Build CinePlayer app (xcodebuild, Debug)
+        working-directory: CinePlayerApp
+        run: >-
+          xcodebuild -project CinePlayer.xcodeproj -scheme CinePlayer
+          -configuration Debug build

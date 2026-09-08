@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+      Quick Look app extensions must be sandboxed regardless of whether the
+      host app is (the main CinePlayer app deliberately is not — see
+      CinePlayerApp/CinePlayer.entitlements). This is NOT a copy of that
+      file: the host app's entitlements are a debug-only
+      `get-task-allow` and nothing else (it isn't sandboxed at all), which
+      would be meaningless/wrong here.
+
+      No file-access entitlement (e.g.
+      com.apple.security.files.user-selected.read-only) is needed alongside
+      this: the system grants a sandboxed Quick Look extension read access
+      to the specific file it's been asked to preview automatically, as
+      part of how the com.apple.quicklook.preview extension point itself
+      works — confirmed against real, shipped sandboxed Quick Look
+      extensions that declare app-sandbox alone and read the file directly
+      (e.g. the open-source "glb-preview" project's PreviewExtension).
+
+      Referenced directly via the CODE_SIGN_ENTITLEMENTS build setting in
+      project.yml (not xcodegen's own `entitlements:` target property,
+      which — confirmed the hard way — regenerates/overwrites this file
+      from a `properties:` map on every `xcodegen generate` and would blank
+      it out entirely if that map were left empty). This matches how the
+      main CinePlayer target's own CinePlayer.entitlements is already
+      referenced.
+    -->
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+    <!--
+      A `com.apple.security.application-groups` entitlement was tried here
+      (2026-08-15) so the "customize the quick look default playback speed"
+      preference could be set from the main app's Settings window and read
+      here (this extension is sandboxed, so it would genuinely need the
+      entitlement to reach a shared container, unlike the main app).
+      Reverted: this machine has zero code-signing identities configured and
+      Xcode refuses to build ANY target declaring an app-group entitlement
+      without a real (even free/Personal-Team) Apple ID signed in — see
+      CinePlayerApp/CinePlayer.entitlements for the exact error. Revisit
+      once that's set up.
+    -->
+</dict>
+</plist>
