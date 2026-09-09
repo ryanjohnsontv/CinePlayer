@@ -52,6 +52,10 @@ public final class CineRenderer {
     /// `uniforms.lutEnabled == 0` branch never actually samples it. See
     /// `LUTTexture.makeIdentityDummy`.
     private let dummyLUTTexture: MTLTexture
+    /// Bound at the four tone-curve texture slots (indices 2-5) for
+    /// whichever `render(...)` isn't given a real texture for — always
+    /// sampled (no enable flag), so it must be a genuine identity ramp.
+    private let dummyToneCurveTexture: MTLTexture
 
     /// - Parameter bundle: Resource bundle to load `CinePlayerShaders.metallib`
     ///   from (deliberately not named "default.metallib" — see the doc
@@ -112,6 +116,7 @@ public final class CineRenderer {
         // this property's own doc comment for why `render(...)` always needs
         // *something* bound at the LUT texture argument slot.
         self.dummyLUTTexture = try LUTTexture.makeIdentityDummy(device: device)
+        self.dummyToneCurveTexture = try ToneCurveTexture.makeIdentityDummy(device: device)
     }
 
     /// Encodes the full-screen tone-mapping render pass into `commandBuffer`,
@@ -139,6 +144,9 @@ public final class CineRenderer {
     ///   unchanged. Passing a real LUT texture only has a visible effect
     ///   when `uniforms.lutEnabled != 0` (`ExposureUniforms`'s own default is
     ///   `false`).
+    /// - Parameter toneCurveTextures: the four tone-curve textures (master +
+    ///   R/G/B). `nil` (or any missing channel) falls back to the dummy
+    ///   identity ramp.
     /// - Parameter grading: the "Cine Colour" grading uniforms (see
     ///   `GradingUniforms`), bound to both stages at buffer index 1.
     ///   Defaults to `.identity`, which is a true no-op through every stage
@@ -159,7 +167,8 @@ public final class CineRenderer {
         colorAttachment: MTLTexture,
         lutTexture: MTLTexture? = nil,
         grading: GradingUniforms = .identity,
-        viewport: ViewportUniforms = .identity
+        viewport: ViewportUniforms = .identity,
+        toneCurveTextures: ToneCurveTextureSet? = nil
     ) {
         let selectedPipeline: MTLRenderPipelineState
         switch colorAttachment.pixelFormat {
@@ -187,6 +196,10 @@ public final class CineRenderer {
         encoder.setRenderPipelineState(selectedPipeline)
         encoder.setFragmentTexture(rawTexture, index: 0)
         encoder.setFragmentTexture(lutTexture ?? dummyLUTTexture, index: 1)
+        encoder.setFragmentTexture(toneCurveTextures?.master ?? dummyToneCurveTexture, index: 2)
+        encoder.setFragmentTexture(toneCurveTextures?.red ?? dummyToneCurveTexture, index: 3)
+        encoder.setFragmentTexture(toneCurveTextures?.green ?? dummyToneCurveTexture, index: 4)
+        encoder.setFragmentTexture(toneCurveTextures?.blue ?? dummyToneCurveTexture, index: 5)
 
         var mutableUniforms = uniforms
         withUnsafeBytes(of: &mutableUniforms) { raw in

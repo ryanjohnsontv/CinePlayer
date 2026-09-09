@@ -239,6 +239,23 @@ struct CineMetalView: NSViewRepresentable {
         view.enableSetNeedsDisplay = true
         view.delegate = context.coordinator
         view.documentModel = documentModel
+        // Explicitly declares this drawable as plain SDR device RGB, not
+        // deferring to whatever default `CAMetalLayer` would otherwise pick
+        // up from the window/display — `tonemapFragment`'s output is
+        // already fully display-encoded (the real Rec.709 OETF, see
+        // `Tonemap.metal`'s own doc comment) and never meant to be
+        // reinterpreted through an EDR/wide-gamut tone curve a second time.
+        // A `CAMetalLayer` can otherwise inherit HDR/extended-range
+        // behavior from the display/window it's hosted in (e.g. a Reference
+        // Mode or an HDR-capable display in a non-default state) even
+        // though nothing in this app's own code ever opts into that, which
+        // reads as exactly this symptom: identical pixel data looks
+        // correctly exposed through any offscreen/file-based path (a PNG,
+        // `cine-diagnostic`) but blown-out only in the live window.
+        if let metalLayer = view.layer as? CAMetalLayer {
+            metalLayer.wantsExtendedDynamicRangeContent = false
+            metalLayer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
+        }
         context.coordinator.update(documentModel: documentModel, playbackController: playbackController, view: view)
         return view
     }
@@ -269,6 +286,7 @@ struct CineMetalView: NSViewRepresentable {
         // needs an async `DecodedFrameCache` fetch), so there's no fetch
         // task/loading-state dance needed for it, just a plain copy.
         private var lutTexture: MTLTexture?
+        private var toneCurveTextures: ToneCurveTextureSet?
         // The active "Cine Colour" grading parameters, read straight from
         // `documentModel.grading` in `update(...)` — same tracking shape as
         // `uniforms` immediately above (a plain `Equatable` value struct, so
@@ -323,6 +341,10 @@ struct CineMetalView: NSViewRepresentable {
         // computation for why this needs its own explicit AnyObject-cast
         // identity comparison rather than plain `!=`/`!==`.
         private var lastRenderedLUTTexture: MTLTexture?
+        private var lastRenderedMasterCurveTexture: MTLTexture?
+        private var lastRenderedRedCurveTexture: MTLTexture?
+        private var lastRenderedGreenCurveTexture: MTLTexture?
+        private var lastRenderedBlueCurveTexture: MTLTexture?
         private var fetchTask: Task<Void, Never>?
 
         @MainActor
@@ -368,6 +390,8 @@ struct CineMetalView: NSViewRepresentable {
             // kept current regardless of whether the frame-index check
             // further down finds anything worth re-fetching for.
             lutTexture = newLUTTexture
+
+            let toneCurveChanged = updateToneCurveTracking(documentModel)
 
             // Mirrors `uniformsChanged`/`lutChanged` immediately above: a
             // slider drag in the "Cine Colour" sidebar section only ever
@@ -430,7 +454,7 @@ struct CineMetalView: NSViewRepresentable {
                 // clear), the raw texture needs to be re-rendered through
                 // the new interpretation without going anywhere near
                 // `DecodedFrameCache`.
-                if uniformsChanged || lutChanged || gradingChanged || viewportChanged {
+                if uniformsChanged || lutChanged || toneCurveChanged || gradingChanged || viewportChanged {
                     view.setNeedsDisplay(view.bounds)
                 }
                 return
@@ -523,10 +547,29 @@ struct CineMetalView: NSViewRepresentable {
                 colorAttachment: drawable.texture,
                 lutTexture: lutTexture,
                 grading: grading,
-                viewport: renderViewport
+                viewport: renderViewport,
+                toneCurveTextures: toneCurveTextures
             )
             commandBuffer.present(drawable)
             commandBuffer.commit()
         }
+    }
+}
+
+extension CineMetalView.Coordinator {
+    @MainActor
+    private func updateToneCurveTracking(_ documentModel: CineDocumentModel) -> Bool {
+        let newToneCurveTextures = documentModel.toneCurveTextures
+        let toneCurveChanged =
+            (newToneCurveTextures?.master as AnyObject?) !== (lastRenderedMasterCurveTexture as AnyObject?)
+            || (newToneCurveTextures?.red as AnyObject?) !== (lastRenderedRedCurveTexture as AnyObject?)
+            || (newToneCurveTextures?.green as AnyObject?) !== (lastRenderedGreenCurveTexture as AnyObject?)
+            || (newToneCurveTextures?.blue as AnyObject?) !== (lastRenderedBlueCurveTexture as AnyObject?)
+        lastRenderedMasterCurveTexture = newToneCurveTextures?.master
+        lastRenderedRedCurveTexture = newToneCurveTextures?.red
+        lastRenderedGreenCurveTexture = newToneCurveTextures?.green
+        lastRenderedBlueCurveTexture = newToneCurveTextures?.blue
+        toneCurveTextures = newToneCurveTextures
+        return toneCurveChanged
     }
 }

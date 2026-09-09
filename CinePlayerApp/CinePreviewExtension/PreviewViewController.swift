@@ -292,7 +292,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, MTK
     /// every `renderer.render(...)` call. Computed exactly once, in
     /// `preparePreviewOfFile(at:)`, rather than per displayed frame: unlike
     /// the old `CinePreviewImage.render` (which rebuilt an `ExposureUniforms`
-    /// from scratch — via its own `private` `previewUniforms(setup:frame:)`
+    /// from scratch — via its own `private` `previewUniforms(cineFile:frame:)`
     /// helper, not reachable from this file — on every single frame it
     /// rendered), black/white levels, debayer mode, CFA phase, calibration,
     /// and gamma are all properties of the *file*, not of any one frame, so
@@ -380,98 +380,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, MTK
         // just below; `transportBar` itself was the one view in this method
         // that got missed.
         transportBar.translatesAutoresizingMaskIntoConstraints = false
-
-        scrubber.isContinuous = true
-        scrubber.target = self
-        scrubber.action = #selector(sliderMoved(_:))
-        scrubber.translatesAutoresizingMaskIntoConstraints = false
-
-        frameLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        frameLabel.textColor = .secondaryLabelColor
-        frameLabel.alignment = .right
-        frameLabel.translatesAutoresizingMaskIntoConstraints = false
-
-        // The three transport buttons — see this type's own doc comment
-        // ("Real transport controls") for what each does. Plain SF Symbol
-        // icons with no bezel/border (`isBordered = false`) so they read as
-        // flat transport-bar glyphs against `transportBar`'s own dark
-        // background rather than as separate raised system buttons — and an
-        // explicit white `contentTintColor`, since this bar's background is
-        // an unconditional dark color regardless of the system's light/dark
-        // appearance (see `transportBar`'s own setup just above), so a
-        // dynamic, appearance-following tint could render dark-on-dark in
-        // light mode.
-        // `.scaleNone`, not `.scaleProportionallyUpOrDown`: the latter
-        // stretches whatever image it's given to fill the button's own
-        // frame, and an SF Symbol's *default* rendered size (no explicit
-        // `NSImage.SymbolConfiguration`) is small enough relative to these
-        // 26-28pt button boxes that "fill the frame" is exactly what made
-        // the play/rewind/fast-forward glyphs look oversized/bold compared
-        // to a standard QuickTime `.mov` Quick Look preview's own transport
-        // bar (AVKit's stock controls keep their icons at a fixed, modest
-        // point size with visible padding inside each button, never
-        // stretched to fill it). `Self.transportGlyphConfiguration`'s
-        // explicit `pointSize` is that fixed size instead — `.scaleNone`
-        // centers it as-is (via `imagePosition = .imageOnly`, unaffected by
-        // this change) rather than scaling it to match the button's own
-        // (unrelated) hit-target size.
-        for button in [rewindButton, playPauseButton, fastForwardButton] {
-            button.isBordered = false
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleNone
-            button.contentTintColor = .white
-            button.translatesAutoresizingMaskIntoConstraints = false
-        }
-        rewindButton.image = NSImage(systemSymbolName: "backward.fill", accessibilityDescription: "Rewind")?
-            .withSymbolConfiguration(Self.transportGlyphConfiguration)
-        rewindButton.target = self
-        rewindButton.action = #selector(rewindClicked)
-
-        // `playPauseButton`'s image starts as `play.fill` (nothing is
-        // playing yet at `loadView()` time — `preparePreviewOfFile(at:)`
-        // itself is what starts playback, later) and is kept in sync from
-        // then on by the `controller.$isPlaying` subscription set up there;
-        // see `updatePlayPauseButton(isPlaying:)`.
-        playPauseButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")?
-            .withSymbolConfiguration(Self.transportGlyphConfiguration)
-        playPauseButton.target = self
-        playPauseButton.action = #selector(playPauseClicked)
-
-        fastForwardButton.image = NSImage(systemSymbolName: "forward.fill", accessibilityDescription: "Fast Forward")?
-            .withSymbolConfiguration(Self.transportGlyphConfiguration)
-        fastForwardButton.target = self
-        fastForwardButton.action = #selector(fastForwardClicked)
-
-        // The fps picker — see this type's own doc comment for why this is
-        // a fixed, user-facing set of standard rates rather than anything
-        // read from the file. Each item's `representedObject` carries the
-        // actual `Double` `setReviewFPS(_:)` should be called with — kept on
-        // the menu item itself (rather than, say, a parallel array indexed
-        // by `indexOfSelectedItem`) so `fpsChanged(_:)` can read it straight
-        // off `sender.selectedItem` with no risk of the two ever drifting
-        // out of sync.
-        fpsPopUp.translatesAutoresizingMaskIntoConstraints = false
-        fpsPopUp.target = self
-        fpsPopUp.action = #selector(fpsChanged(_:))
-        // Speed multipliers, not absolute rates — each `representedObject`
-        // carries the actual multiplier `fpsChanged(_:)` both persists and
-        // multiplies against `fileOwnReviewFPS`. "1x" plays at exactly this
-        // file's own rate.
-        let speedOptions: [(title: String, multiplier: Double)] = [
-            ("1x", 1.0),
-            ("2x", 2.0),
-            ("5x", 5.0),
-            ("10x", 10.0)
-        ]
-        for option in speedOptions {
-            fpsPopUp.addItem(withTitle: option.title)
-            fpsPopUp.lastItem?.representedObject = option.multiplier as NSNumber
-        }
-        // Defaults to "1x" — immediately superseded by
-        // `selectFPSPopUpItem(forMultiplier:)` once `preparePreviewOfFile`
-        // reads the actual persisted `QuickLookPlaybackPreferences.
-        // speedMultiplier`.
-        fpsPopUp.selectItem(withTitle: "1x")
+        configureTransportBarControls()
 
         // `mtkView`-specific setup, matching the live app's own
         // `CineMetalView` exactly (see that file's doc comment): driven
@@ -591,7 +500,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, MTK
         )
 
         // A one-time, cache-bypassing decode of frame 0's raw pixels,
-        // purely so `ExposureUniforms.init(setup:frame:debayerMode:)`'s
+        // purely so `ExposureUniforms.init(cineFile:frame:debayerMode:lutEnabled:)`'s
         // internal `CalibrationPlausibility` check has real pixel data to
         // sanity-check this file's own recorded color calibration against —
         // mirrors `CineDocumentModel.open(url:)`'s identical one-off decode,
@@ -602,7 +511,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, MTK
         // frame-to-frame).
         let firstFrame = try cineFile.decodeFrame(at: 0)
         uniforms = ExposureUniforms(
-            setup: cineFile.setup,
+            cineFile: cineFile,
             frame: firstFrame,
             debayerMode: .highQuality
         )
@@ -650,81 +559,7 @@ final class PreviewViewController: NSViewController, QLPreviewingController, MTK
         scrubber.doubleValue = 0
         updateFrameLabel(frameNumber: 0, frameCount: cineFile.frameCount)
 
-        // The single "a frame worth displaying might have changed" trigger
-        // this whole file is built around — see this type's own doc comment
-        // for why a plain AppKit extension needs to build this by hand
-        // (SwiftUI's own diffing does this for free in the live app) and
-        // why neither this closure nor the one below needs
-        // `MainActor.assumeIsolated`.
-        controller.$currentFrameIndex
-            .sink { [weak self] frameIndex in
-                self?.handleCurrentFrameIndexChanged(frameIndex)
-            }
-            .store(in: &cancellables)
-
-        // Implements looping by hand, since `PlaybackController` itself
-        // never wraps around (see this type's own doc comment). Fires on
-        // every *genuine transition* to `isPlaying == false` (see
-        // `.removeDuplicates()` below), but only actually restarts playback
-        // when `currentFrameIndex` has already reached `effectiveOutPoint`
-        // at the moment this runs — which is exactly, and only, true when
-        // playback stopped because it ran off the end on its own, not
-        // because something else (today: only `sliderMoved(_:)`'s own
-        // `pause()`) paused it deliberately.
-        //
-        // That distinction mostly falls out of `PlaybackController`'s own
-        // statement ordering: its internal play loop calls
-        // `setCurrentFrameIndex(next)` — updating `currentFrameIndex` to
-        // `effectiveOutPoint` — BEFORE setting `isPlaying = false` once the
-        // loop naturally ends, so by the time this subscription observes
-        // `isPlaying == false`, `currentFrameIndex` already reads as the
-        // boundary. `pause()`, by contrast (called directly by
-        // `sliderMoved(_:)`, and internally by `seek(to:)`/`step(by:)`),
-        // sets `isPlaying = false` FIRST and only moves `currentFrameIndex`
-        // afterward (if at all) — so an ordinary mid-clip pause/scrub is
-        // observed here with `currentFrameIndex` still sitting at whatever
-        // *pre*-seek position it was.
-        //
-        // `.removeDuplicates()` closes a real gap in that reasoning: `@Published`
-        // broadcasts on every assignment, including a same-value one — it does
-        // not check whether the new value actually differs from the old one.
-        // `sliderMoved(_:)` calls `pause()` unconditionally on every single
-        // drag tick (the scrubber is `isContinuous`), so once the user has
-        // dragged all the way to the last frame — leaving `currentFrameIndex
-        // == effectiveOutPoint` with `isPlaying` already `false` — the very
-        // next drag tick's `pause()` call reasserts `isPlaying = false` onto
-        // an already-`false` value. Without `.removeDuplicates()`, that
-        // redundant assignment still re-fires this sink, which would read
-        // `currentFrameIndex` as still `effectiveOutPoint` (this tick's own
-        // `seek(to:)` hasn't run yet) and wrongly treat an ordinary
-        // "drag away from the end" gesture as "played off the natural end,"
-        // restarting playback out from under the user's own in-progress drag.
-        // Filtering to genuine `true`→`false` edges makes a same-value
-        // `pause()`-while-already-paused a true no-op here, exactly as
-        // dragging in the middle of the range already was.
-        controller.$isPlaying
-            .removeDuplicates()
-            .sink { [weak controller] isPlaying in
-                guard let controller, !isPlaying else { return }
-                guard controller.currentFrameIndex >= controller.effectiveOutPoint else { return }
-                controller.seek(to: controller.effectiveInPoint)
-                controller.play(rate: .forwardNormal)
-            }
-            .store(in: &cancellables)
-
-        // Keeps `playPauseButton`'s image in sync with actual playback
-        // state, whatever caused it to change — this button, `scrubber`,
-        // or the loop-restart subscription just above all funnel through
-        // the same `PlaybackController`, so one subscription here correctly
-        // covers every case. No `.removeDuplicates()` needed here (unlike
-        // the loop-restart subscription above): redundantly setting the
-        // same SF Symbol image on a same-value re-emission is harmless, it
-        // just repaints the identical icon.
-        controller.$isPlaying
-            .sink { [weak self] isPlaying in
-                self?.updatePlayPauseButton(isPlaying: isPlaying)
-            }
-            .store(in: &cancellables)
+        subscribeToPlaybackController(controller)
 
         // Kicks off playback without waiting for a first frame to actually
         // land on screen — see this type's own doc comment on `@MainActor`
@@ -990,5 +825,86 @@ final class PreviewViewController: NSViewController, QLPreviewingController, MTK
     isolated deinit {
         playbackController?.pause()
         textureFetchTask?.cancel()
+    }
+}
+
+extension PreviewViewController {
+    private func configureTransportBarControls() {
+        scrubber.isContinuous = true
+        scrubber.target = self
+        scrubber.action = #selector(sliderMoved(_:))
+        scrubber.translatesAutoresizingMaskIntoConstraints = false
+
+        frameLabel.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+        frameLabel.textColor = .secondaryLabelColor
+        frameLabel.alignment = .right
+        frameLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        // Flat glyphs (no bezel), explicit white tint since the bar's
+        // background is always dark regardless of appearance.
+        for button in [rewindButton, playPauseButton, fastForwardButton] {
+            button.isBordered = false
+            button.imagePosition = .imageOnly
+            button.imageScaling = .scaleNone
+            button.contentTintColor = .white
+            button.translatesAutoresizingMaskIntoConstraints = false
+        }
+        rewindButton.image = NSImage(systemSymbolName: "backward.fill", accessibilityDescription: "Rewind")?
+            .withSymbolConfiguration(Self.transportGlyphConfiguration)
+        rewindButton.target = self
+        rewindButton.action = #selector(rewindClicked)
+
+        playPauseButton.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "Play")?
+            .withSymbolConfiguration(Self.transportGlyphConfiguration)
+        playPauseButton.target = self
+        playPauseButton.action = #selector(playPauseClicked)
+
+        fastForwardButton.image = NSImage(systemSymbolName: "forward.fill", accessibilityDescription: "Fast Forward")?
+            .withSymbolConfiguration(Self.transportGlyphConfiguration)
+        fastForwardButton.target = self
+        fastForwardButton.action = #selector(fastForwardClicked)
+
+        fpsPopUp.translatesAutoresizingMaskIntoConstraints = false
+        fpsPopUp.target = self
+        fpsPopUp.action = #selector(fpsChanged(_:))
+        let speedOptions: [(title: String, multiplier: Double)] = [
+            ("1x", 1.0),
+            ("2x", 2.0),
+            ("5x", 5.0),
+            ("10x", 10.0)
+        ]
+        for option in speedOptions {
+            fpsPopUp.addItem(withTitle: option.title)
+            fpsPopUp.lastItem?.representedObject = option.multiplier as NSNumber
+        }
+        // Superseded by selectFPSPopUpItem once the saved preference loads.
+        fpsPopUp.selectItem(withTitle: "1x")
+    }
+
+    private func subscribeToPlaybackController(_ controller: PlaybackController) {
+        controller.$currentFrameIndex
+            .sink { [weak self] frameIndex in
+                self?.handleCurrentFrameIndexChanged(frameIndex)
+            }
+            .store(in: &cancellables)
+
+        // Implements looping by hand. `.removeDuplicates()` avoids
+        // re-triggering a restart from a redundant pause() while already
+        // paused at the end (e.g. from dragging the scrubber there).
+        controller.$isPlaying
+            .removeDuplicates()
+            .sink { [weak controller] isPlaying in
+                guard let controller, !isPlaying else { return }
+                guard controller.currentFrameIndex >= controller.effectiveOutPoint else { return }
+                controller.seek(to: controller.effectiveInPoint)
+                controller.play(rate: .forwardNormal)
+            }
+            .store(in: &cancellables)
+
+        controller.$isPlaying
+            .sink { [weak self] isPlaying in
+                self?.updatePlayPauseButton(isPlaying: isPlaying)
+            }
+            .store(in: &cancellables)
     }
 }

@@ -2,11 +2,7 @@ import Testing
 @testable import CineKit
 @testable import CinePlayerCore
 
-/// `CalibrationPlausibility` is the heuristic behind the "Color-matrix
-/// residual color cast" item in the README's Known Limitations — today it's
-/// wired into `cine-diagnostic` but not the live app, and (per that same
-/// section) had no automated coverage at all. Every fixture here is a small
-/// synthetic `DecodedFrame`, not a real `.cine` sample, so these always run
+/// Synthetic-fixture tests for `CalibrationPlausibility` — always run
 /// regardless of `CINE_SAMPLES_DIR`.
 struct CalibrationPlausibilityTests {
     /// An 8x8 RGGB-tiled frame (four 2x2 tiles in each dimension — well
@@ -135,5 +131,104 @@ struct CalibrationPlausibilityTests {
         )
         let result = CalibrationPlausibility.vetoedCalibration(distorting, frame: frame, cfaPhase: .rggb, blackLevel: 0, whiteLevel: 1023)
         #expect(result == distorting)
+    }
+
+    @Test func nativeChannelTriplesReturnsOneTriplePerSampledTile() {
+        let frame = Self.uniformFrame(r: 600, g: 500, b: 400)
+        let triples = CalibrationPlausibility.nativeChannelTriples(frame: frame, cfaPhase: .rggb, blackLevel: 0)
+        // An 8x8 frame sampled on `stride`'s 4-pixel grid visits (0,0) and
+        // (4,0)/(0,4)/(4,4) — 4 tiles — each producing exactly one triple,
+        // and every tile in this uniform fixture reads the same values.
+        #expect(triples.count == 4)
+        for triple in triples {
+            #expect(triple.r == 600)
+            #expect(triple.g == 500)
+            #expect(triple.b == 400)
+        }
+    }
+
+    @Test func nativeChannelTriplesSubtractsBlackLevel() {
+        let frame = Self.uniformFrame(r: 600, g: 500, b: 400)
+        let triples = CalibrationPlausibility.nativeChannelTriples(frame: frame, cfaPhase: .rggb, blackLevel: 100)
+        #expect(triples.allSatisfy { $0.r == 500 && $0.g == 400 && $0.b == 300 })
+    }
+
+    @Test func clippingFractionIsZeroForANeutralCalibration() {
+        let triples: [(r: Float, g: Float, b: Float)] = [(600, 500, 400), (100, 500, 900)]
+        #expect(CalibrationPlausibility.clippingFraction(Self.neutralCalibration, for: triples) == 0)
+    }
+
+    @Test func clippingFractionCountsLocationsPushedNegative() {
+        let clippingMatrix = ColorCalibration(
+            whiteBalanceR: 1, whiteBalanceG: 1, whiteBalanceB: 1,
+            matrix: [1, 0, 0, 0, 1, 0, 0, -1, 1]
+        )
+        let triples: [(r: Float, g: Float, b: Float)] = [
+            (100, 100, 100),
+            (100, 200, 50),
+            (100, 50, 200),
+        ]
+        #expect(CalibrationPlausibility.clippingFraction(clippingMatrix, for: triples) == Float(1) / 3)
+    }
+
+    @Test func clippingFractionIsZeroForEmptyTriples() {
+        #expect(CalibrationPlausibility.clippingFraction(Self.neutralCalibration, for: []) == 0)
+    }
+
+    /// Like `uniformFrame`, but each tile gets its own r/g/b pattern.
+    private static func tiledFrame(patterns: [(r: UInt16, g: UInt16, b: UInt16)]) -> DecodedFrame {
+        let width = patterns.count * 4
+        let height = 4
+        var pixels = [UInt16](repeating: 0, count: width * height)
+        for (tileIndex, pattern) in patterns.enumerated() {
+            let originX = tileIndex * 4
+            for y in 0..<2 {
+                for x in 0..<2 {
+                    let value: UInt16
+                    switch (x, y) {
+                    case (0, 0): value = pattern.r
+                    case (1, 1): value = pattern.b
+                    default: value = pattern.g
+                    }
+                    pixels[y * width + (originX + x)] = value
+                }
+            }
+        }
+        return DecodedFrame(index: 0, width: width, height: height, pixels: pixels, needsVerticalFlip: false)
+    }
+
+    @Test func vetoedCalibrationCatchesACalibrationThatClipsLocallyDespitePassingOnAverage() {
+        // Passes on frame-average alone, but one of three tiles clips
+        // locally — must still be vetoed.
+        let frame = Self.tiledFrame(patterns: [
+            (r: 100, g: 300, b: 100),
+            (r: 300, g: 100, b: 100),
+            (r: 100, g: 100, b: 300),
+        ])
+        let clippingMatrix = ColorCalibration(
+            whiteBalanceR: 1, whiteBalanceG: 1, whiteBalanceB: 1,
+            matrix: [1, 0, 0, 0, 1, 0, 1, -1, 1]
+        )
+        let native = CalibrationPlausibility.nativeChannelAverages(frame: frame, cfaPhase: .rggb, blackLevel: 0, whiteLevel: 1023)
+        #expect(CalibrationPlausibility.isPlausible(clippingMatrix, for: (native.r, native.g, native.b)))
+        let result = CalibrationPlausibility.vetoedCalibration(clippingMatrix, frame: frame, cfaPhase: .rggb, blackLevel: 0, whiteLevel: 1023)
+        #expect(result != clippingMatrix)
+    }
+
+    @Test func vetoedCalibrationSelectsAKnownCameraFallbackByHardwareVersion() {
+        let frame = Self.uniformFrame(r: 500, g: 500, b: 500)
+        let distorting = ColorCalibration(
+            whiteBalanceR: 2, whiteBalanceG: 1, whiteBalanceB: 1,
+            matrix: [1, 0, 0, 0, 1, 0, 0, 0, 1]
+        )
+        let unknownCameraResult = CalibrationPlausibility.vetoedCalibration(
+            distorting, frame: frame, cfaPhase: .rggb, blackLevel: 0, whiteLevel: 1023, cameraVersion: nil
+        )
+        let veoResult = CalibrationPlausibility.vetoedCalibration(
+            distorting, frame: frame, cfaPhase: .rggb, blackLevel: 0, whiteLevel: 1023, cameraVersion: 7011
+        )
+        #expect(unknownCameraResult != distorting)
+        #expect(veoResult != distorting)
+        #expect(unknownCameraResult != veoResult)
     }
 }

@@ -41,7 +41,7 @@ struct HistogramView: View {
     /// standard way photo/video histogram UIs, ACR included, keep shadow/
     /// highlight detail visible instead of one spike flattening the rest.
     private func channelPath(_ bins: [Int], in size: CGSize) -> Path {
-        let maxCount = bins.max().map(Double.init) ?? 0
+        let maxCount: Double = bins.max().map(Double.init) ?? 0
         guard maxCount > 0 else { return Path() }
         let maxHeight = sqrt(maxCount)
         let binWidth = size.width / CGFloat(FrameHistogram.binCount)

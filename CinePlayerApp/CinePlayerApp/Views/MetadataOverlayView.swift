@@ -77,12 +77,13 @@ struct MetadataOverlayView: View {
             if let shutterText {
                 overlayRow(shutterText)
             }
-            // `cameraModel` can be present-but-empty (see
-            // `CineDocumentModel.cameraModel`'s own doc comment) — most real
-            // files have neither, so this row is simply omitted rather than
-            // showing a blank line.
-            if let cameraModel = documentModel.cameraModel, !cameraModel.isEmpty {
-                overlayRow(cameraModel)
+            // Falls back to the camera serial number when the fuller model
+            // string is absent-or-empty (the common case in practice — see
+            // `CineDocumentModel.cameraIdentifierForDisplay`'s own doc
+            // comment) — omitted entirely only when the file carries
+            // neither.
+            if let cameraIdentifier = documentModel.cameraIdentifierForDisplay {
+                overlayRow(cameraIdentifier)
             }
         }
         .padding(.horizontal, 8)

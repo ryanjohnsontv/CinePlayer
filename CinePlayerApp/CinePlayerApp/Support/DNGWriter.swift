@@ -124,7 +124,7 @@ enum DNGWriter {
         }
         let redX = baseRedOffset.x
 
-        let levels = cineFile.setup.effectiveBlackWhiteLevels
+        let levels = cineFile.effectiveBlackWhiteLevels
         let calibration = cineFile.setup.colorCalibration ?? .identity
         let rawModel = cineFile.setup.cameraModel?.trimmingCharacters(in: .whitespacesAndNewlines)
         let modelName = (rawModel?.isEmpty == false) ? rawModel! : "Phantom"

@@ -125,7 +125,7 @@ public enum CinePreviewImage {
     ) throws -> CGImage {
         let frame = try cineFile.decodeFrame(at: frameIndex)
         let rawTexture = try makeFrameTexture(device: device, frame: frame)
-        let uniforms = previewUniforms(setup: cineFile.setup, frame: frame)
+        let uniforms = previewUniforms(cineFile: cineFile, frame: frame)
 
         let renderer = try renderer ?? CineRenderer(device: device, bundle: rendererBundle)
 
@@ -190,15 +190,18 @@ public enum CinePreviewImage {
     /// See this type's doc comment for the reasoning behind this fixed
     /// choice of debayer mode + calibration. Deliberately built via
     /// `ExposureUniforms`'s low-level member-wise initializer (not the
-    /// `init(setup:frame:debayerMode:)` convenience initializer used only by
-    /// `cine-diagnostic`) — but still runs the file's raw calibration through
-    /// the same `CalibrationPlausibility.vetoedCalibration` veto
+    /// `init(cineFile:frame:debayerMode:)` convenience initializer used only
+    /// by `cine-diagnostic`) — but still runs the file's raw calibration
+    /// through the same `CalibrationPlausibility.vetoedCalibration` veto
     /// `CineDocumentModel.open(url:)` applies, using `frame` (already decoded
     /// by the caller) as the real pixel data to check it against, so this
     /// can't apply a calibration the live app itself would have rejected as
-    /// implausible for this exact file.
-    private static func previewUniforms(setup: CineSetup, frame: DecodedFrame) -> ExposureUniforms {
-        let levels = setup.effectiveBlackWhiteLevels
+    /// implausible for this exact file — `cameraVersion` included, so a
+    /// vetoed file gets the same per-camera fallback the live app and
+    /// `cine-diagnostic` do, not always the generic one.
+    private static func previewUniforms(cineFile: CineFile, frame: DecodedFrame) -> ExposureUniforms {
+        let setup = cineFile.setup
+        let levels = cineFile.effectiveBlackWhiteLevels
         let cfaPhase = CFAPhase.forCFAPattern(setup.cfa)
         let rawCalibration = setup.colorCalibration ?? .identity
         // Full white balance + color matrix — not forced to identity — the
@@ -210,7 +213,8 @@ public enum CinePreviewImage {
             frame: frame,
             cfaPhase: cfaPhase,
             blackLevel: Float(levels.black),
-            whiteLevel: Float(levels.white)
+            whiteLevel: Float(levels.white),
+            cameraVersion: setup.cameraVersion
         )
         return ExposureUniforms(
             blackLevel: Float(levels.black),

@@ -65,7 +65,8 @@ public enum FrameHistogramComputer {
         renderer: CineRenderer,
         device: MTLDevice,
         lutTexture: MTLTexture? = nil,
-        targetDimension: Int = 128
+        targetDimension: Int = 128,
+        toneCurveTextures: ToneCurveTextureSet? = nil
     ) throws -> FrameHistogram {
         let descriptor = MTLTextureDescriptor.texture2DDescriptor(
             pixelFormat: .bgra8Unorm,
@@ -94,7 +95,8 @@ public enum FrameHistogramComputer {
             into: commandBuffer,
             colorAttachment: targetTexture,
             lutTexture: lutTexture,
-            grading: grading
+            grading: grading,
+            toneCurveTextures: toneCurveTextures
         )
 
         guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {

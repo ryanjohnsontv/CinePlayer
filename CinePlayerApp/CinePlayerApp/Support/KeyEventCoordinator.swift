@@ -151,18 +151,10 @@ final class KeyEventCoordinator {
         // in/out point," distinct from Home/End's "go to start/end of the
         // whole file" — most useful once a trim range narrows the two.
         case KeyCode.i:
-            if isShiftDown {
-                controller.seek(to: controller.effectiveInPoint)
-            } else {
-                controller.setInPoint(controller.currentFrameIndex)
-            }
+            handleSetInPoint(isShiftDown: isShiftDown, controller: controller)
             return nil
         case KeyCode.o:
-            if isShiftDown {
-                controller.seek(to: controller.effectiveOutPoint)
-            } else {
-                controller.setOutPoint(controller.currentFrameIndex)
-            }
+            handleSetOutPoint(isShiftDown: isShiftDown, controller: controller)
             return nil
         default:
             // `.command` is already handled by the early return above; this
@@ -171,6 +163,22 @@ final class KeyEventCoordinator {
                 return event
             }
             return nil
+        }
+    }
+
+    private func handleSetInPoint(isShiftDown: Bool, controller: PlaybackController) {
+        if isShiftDown {
+            controller.seek(to: controller.effectiveInPoint)
+        } else {
+            controller.setInPoint(controller.currentFrameIndex)
+        }
+    }
+
+    private func handleSetOutPoint(isShiftDown: Bool, controller: PlaybackController) {
+        if isShiftDown {
+            controller.seek(to: controller.effectiveOutPoint)
+        } else {
+            controller.setOutPoint(controller.currentFrameIndex)
         }
     }
 }

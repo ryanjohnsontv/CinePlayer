@@ -30,12 +30,18 @@ struct FrameNumberingModeTests {
     @Test func smpteRollsOverHoursAndMinutesCorrectly() {
         // 1 hour, 1 minute, 1 second, frame 5 at a nominal 30fps.
         let index = ((3600 + 60 + 1) * 30) + 5
-        #expect(FrameNumberingMode.formattedFrameNumber(index, mode: .smpte, frameCount: index + 1, reviewFPS: 30, firstImageNo: 0) == "01:01:01:05@30")
+        let formatted = FrameNumberingMode.formattedFrameNumber(
+            index, mode: .smpte, frameCount: index + 1, reviewFPS: 30, firstImageNo: 0
+        )
+        #expect(formatted == "01:01:01:05@30")
     }
 
     @Test func counterTextPairsCurrentWithLastFrameExceptInSMPTEMode() {
         #expect(FrameNumberingMode.counterText(mode: .plain, currentIndex: 0, frameCount: 10, reviewFPS: 30, firstImageNo: 0) == "Frame 1 / 10")
-        #expect(FrameNumberingMode.counterText(mode: .phantom, currentIndex: 0, frameCount: 450, reviewFPS: 30, firstImageNo: -2658) == "Frame -2,658 / -2,209")
+        let phantomText = FrameNumberingMode.counterText(
+            mode: .phantom, currentIndex: 0, frameCount: 450, reviewFPS: 30, firstImageNo: -2658
+        )
+        #expect(phantomText == "Frame -2,658 / -2,209")
         // SMPTE is self-contained timecode, never a "current / last" pair.
         #expect(FrameNumberingMode.counterText(mode: .smpte, currentIndex: 0, frameCount: 10, reviewFPS: 30, firstImageNo: 0) == "00:00:00:00@30")
     }

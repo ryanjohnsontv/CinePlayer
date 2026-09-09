@@ -40,30 +40,9 @@ struct ExposureUniforms {
     uint lutEnabled; // 0 or 1; gates tonemapFragment's post-gamma 3D LUT sample
 };
 
-/// Mirrors `GradingUniforms` in Swift exactly (sixteen 4-byte fields, no
-/// padding) — the "Cine Colour" grading stage. Bound at buffer index 1 on
-/// both `tonemapVertex` and `tonemapFragment` (independent of the
-/// fragment's `texture(1)` LUT slot — buffer and texture argument tables are
-/// separate in Metal, so the two indices don't collide).
-///
-/// `gain`/`gainR`/`gainG`/`gainB` and `pedestal`/`pedestalR`/`pedestalG`/
-/// `pedestalB` apply in the linear, normalized-to-[0,1] domain, right after
-/// the black/white stretch and before `applyGamma`. `gammaTrim`/
-/// `gammaTrimR`/`gammaTrimB`/`gammaTrimG`, `brightness`, `hue`, and
-/// `saturation` apply in the display-encoded domain, after `applyGamma`
-/// and before the LUT stage. `flipHorizontal` (0 or
-/// 1) mirrors the U texture
-/// coordinate in `tonemapVertex`, exactly like `ExposureUniforms.
-/// flipVertically` mirrors V.
-///
-/// `gammaTrimG` and `hue` were added after the other fields (both this
-/// struct's field order and the Metal buffer layout are append-only for
-/// backward compatibility with any already-serialized grade sidecar) — see
-/// `GradingUniforms.swift`'s own doc comment for why.
-///
-/// See `GradingUniforms.swift`'s doc comment for the full pipeline-placement
-/// rationale and the by-hand proof that `.identity` (every field at the
-/// value listed below) is a true no-op through every stage it touches.
+/// Mirrors `GradingUniforms` in Swift exactly — see that file's doc
+/// comment. Bound at buffer index 1 on both `tonemapVertex` and
+/// `tonemapFragment`; append-only field order.
 struct GradingUniforms {
     float brightness;
     float gain;
@@ -81,6 +60,9 @@ struct GradingUniforms {
     float saturation;
     float hue;
     uint flipHorizontal;
+    uint flipVertical;
+    float exposureIndexGain;
+    uint rotationQuarterTurns; // 0-3, quarter turns clockwise
 };
 
 /// Mirrors `ViewportUniforms` in Swift exactly (three 4-byte fields, no
@@ -138,11 +120,22 @@ vertex VertexOut tonemapVertex(uint vertexID [[vertex_id]],
         uv.y = 1.0 - uv.y;
     }
 
-    // "Cine Colour" grading's one vertex-stage control: mirrors the U
-    // coordinate, exactly the same shape as `flipVertically` above mirroring
-    // V. Neutral (`flipHorizontal == 0`) is a no-op.
+    // User-facing flip controls; stack with `flipVertically` above.
     if (grading.flipHorizontal != 0) {
         uv.x = 1.0 - uv.x;
+    }
+    if (grading.flipVertical != 0) {
+        uv.y = 1.0 - uv.y;
+    }
+
+    // Rotate control: 0-3 quarter turns clockwise, applied before zoom/pan
+    // so panning acts on the final displayed orientation.
+    if (grading.rotationQuarterTurns == 1) {
+        uv = float2(uv.y, 1.0 - uv.x);
+    } else if (grading.rotationQuarterTurns == 2) {
+        uv = float2(1.0 - uv.x, 1.0 - uv.y);
+    } else if (grading.rotationQuarterTurns == 3) {
+        uv = float2(1.0 - uv.y, uv.x);
     }
 
     // Zoom/pan: shrink the sampled UV footprint around `viewport`'s center by
@@ -229,11 +222,30 @@ inline float readClampedWB(texture2d<ushort, access::read> rawTexture, int2 coor
 /// Applies `uniforms.colorMatrix` (row-major 3x3) to a demosaiced RGB
 /// triple — the post-demosaic half of `cmCalib`'s decomposition, bringing
 /// white-balanced camera-native RGB to Rec. 709.
+///
+/// Operates on the *black-subtracted* signal, re-adding `blackLevel`
+/// afterward — exactly the same subtract/transform/re-add shape
+/// `readClampedWB` already uses for the white-balance gain, and for the same
+/// reason: `rgb` still carries the sensor's fixed black-level pedestal in
+/// every channel, and a general 3x3 matrix has no reason to leave a
+/// (blackLevel, blackLevel, blackLevel) input unchanged — only a matrix
+/// whose every row happens to sum to exactly 1 would (that's the one linear
+/// map that fixes the grey point at any scale, including the pedestal's own
+/// grey value). A calibration matrix has no reason to satisfy that by
+/// construction — `ColorCalibration.identity` does (each row is a one-hot
+/// unit vector), but a fitted, cross-mixing correction generally does not —
+/// so passing the raw pedestal through the matrix unmodified would scale it
+/// by each row's sum, and `tonemapValue` below only ever subtracts it back
+/// out once, at its original (unscaled) value. Isolating the pedestal here
+/// removes that requirement entirely: whatever `colorMatrix` is, it only
+/// ever sees and transforms real scene signal, never the sensor's fixed
+/// offset.
 inline float3 applyColorMatrix(float3 rgb, constant ExposureUniforms &uniforms) {
-    float r = uniforms.colorMatrix[0] * rgb.r + uniforms.colorMatrix[1] * rgb.g + uniforms.colorMatrix[2] * rgb.b;
-    float g = uniforms.colorMatrix[3] * rgb.r + uniforms.colorMatrix[4] * rgb.g + uniforms.colorMatrix[5] * rgb.b;
-    float b = uniforms.colorMatrix[6] * rgb.r + uniforms.colorMatrix[7] * rgb.g + uniforms.colorMatrix[8] * rgb.b;
-    return float3(r, g, b);
+    float3 signal = rgb - uniforms.blackLevel;
+    float r = uniforms.colorMatrix[0] * signal.r + uniforms.colorMatrix[1] * signal.g + uniforms.colorMatrix[2] * signal.b;
+    float g = uniforms.colorMatrix[3] * signal.r + uniforms.colorMatrix[4] * signal.g + uniforms.colorMatrix[5] * signal.b;
+    float b = uniforms.colorMatrix[6] * signal.r + uniforms.colorMatrix[7] * signal.g + uniforms.colorMatrix[8] * signal.b;
+    return float3(r, g, b) + uniforms.blackLevel;
 }
 
 /// The real ITU-R BT.709 opto-electronic transfer function (OETF) — the
@@ -486,6 +498,10 @@ inline float3 malvarHeCutlerDemosaic(texture2d<ushort, access::read> rawTexture,
 fragment float4 tonemapFragment(VertexOut in [[stage_in]],
                                  texture2d<ushort, access::read> rawTexture [[texture(0)]],
                                  texture3d<float> lutTexture [[texture(1)]],
+                                 texture1d<float> masterCurveTexture [[texture(2)]],
+                                 texture1d<float> redCurveTexture [[texture(3)]],
+                                 texture1d<float> greenCurveTexture [[texture(4)]],
+                                 texture1d<float> blueCurveTexture [[texture(5)]],
                                  constant ExposureUniforms &uniforms [[buffer(0)]],
                                  constant GradingUniforms &grading [[buffer(1)]]) {
     uint width = rawTexture.get_width();
@@ -537,25 +553,15 @@ fragment float4 tonemapFragment(VertexOut in [[stage_in]],
     rgb = applyColorMatrix(rgb, uniforms);
     float3 stretched = float3(tonemapValue(rgb.r, uniforms), tonemapValue(rgb.g, uniforms), tonemapValue(rgb.b, uniforms));
 
-    // "Cine Colour" grading, stage 1 (linear domain): gain (multiplicative)
-    // and pedestal (additive black-lift), each a master value combined with
-    // a per-channel offset/multiplier. Neutral defaults (gain*==1,
-    // pedestal*==0) make this an exact no-op — see `GradingUniforms`'s doc
-    // comment for the by-hand proof.
-    float3 gain3 = float3(grading.gain * grading.gainR, grading.gain * grading.gainG, grading.gain * grading.gainB);
+    // Cine Colour stage 1 (linear domain): gain + pedestal.
+    float3 gain3 = float3(grading.gain * grading.gainR, grading.gain * grading.gainG, grading.gain * grading.gainB) * grading.exposureIndexGain;
     float3 pedestal3 = float3(grading.pedestal + grading.pedestalR, grading.pedestal + grading.pedestalG, grading.pedestal + grading.pedestalB);
     stretched = clamp(stretched * gain3 + pedestal3, 0.0, 1.0);
 
     float3 encoded = applyGamma(stretched, uniforms);
 
-    // "Cine Colour" grading, stage 2 (display-encoded domain): gamma trim
-    // (master + independent R/G/B offset), brightness (additive), hue
-    // (luma-preserving rotation), and saturation (luma-preserving lerp) —
-    // applied here, after gamma and before the LUT stage below, so a loaded
-    // LUT always sees the fully-graded image. Neutral defaults
-    // (gammaTrim==1, gammaTrimR==gammaTrimG==gammaTrimB==0, brightness==0,
-    // hue==0, saturation==1) make this an exact no-op — see
-    // `GradingUniforms`'s doc comment for the by-hand proof.
+    // Cine Colour stage 2 (display-encoded domain): gamma trim, brightness,
+    // hue, saturation.
     float gammaR = max(0.01, grading.gammaTrim + grading.gammaTrimR);
     float gammaGCh = max(0.01, grading.gammaTrim + grading.gammaTrimG);
     float gammaB = max(0.01, grading.gammaTrim + grading.gammaTrimB);
@@ -568,6 +574,20 @@ fragment float4 tonemapFragment(VertexOut in [[stage_in]],
     encoded = clamp(applyHueRotation(encoded, grading.hue), 0.0, 1.0);
     float luma = dot(encoded, float3(0.2126, 0.7152, 0.0722));
     encoded = clamp(luma + (encoded - luma) * grading.saturation, 0.0, 1.0);
+
+    // Cine Colour stage 3: master curve applied to all channels, then
+    // independent per-channel curves.
+    constexpr sampler toneCurveSampler(filter::linear, address::clamp_to_edge);
+    encoded = float3(
+        masterCurveTexture.sample(toneCurveSampler, encoded.r).r,
+        masterCurveTexture.sample(toneCurveSampler, encoded.g).r,
+        masterCurveTexture.sample(toneCurveSampler, encoded.b).r
+    );
+    encoded = float3(
+        redCurveTexture.sample(toneCurveSampler, encoded.r).r,
+        greenCurveTexture.sample(toneCurveSampler, encoded.g).r,
+        blueCurveTexture.sample(toneCurveSampler, encoded.b).r
+    );
 
     // Optional 3D color-grading LUT (see `LUTTexture`/`CubeLUT` in
     // CinePlayerCore/CineKit), sampled here against `encoded` — the final,
