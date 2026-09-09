@@ -23,6 +23,11 @@ Have a feature you'd like to see, or run into something that doesn't work the wa
   Control-click) `CinePlayer.app` and choose Open, then confirm Open in the
   dialog that follows — only needed once per download, after that it opens
   normally.
+- **Finder thumbnails and QuickLook preview** (see Features below) only
+  register with the system after `CinePlayer.app` has been launched at
+  least once from its final location — macOS won't discover them from
+  inside a zip or before the first launch. Once you've opened the app one
+  time, both work everywhere in Finder without it needing to stay open.
 
 Prefer to build it yourself instead? See "Building from source" under For
 developers below.
@@ -73,6 +78,13 @@ Everything below is wired up in the current code, not aspirational:
 - **Batch conversion**: `cine-batch-convert` (a command-line tool, see For
   developers below) converts every `.cine` file in a directory to video
   without opening the GUI.
+- **Finder integration**: `.cine` files show real decoded-frame thumbnails
+  in Finder (icon view, list view, Spotlight results) instead of a generic
+  file icon, and pressing Space in Finder opens a genuine QuickLook
+  preview — not just a static frame, but a real scrubbable, playable
+  mini-player with play/pause, rewind/fast-forward, and an FPS picker,
+  rendered through the same Metal pipeline as the main app. Neither
+  requires opening CinePlayer itself.
 
 ## Known limitations
 
@@ -84,12 +96,16 @@ Everything below is wired up in the current code, not aspirational:
   fix today is the manual "Color Matrix" toggle in the playback toolbar:
   turning it off falls back to an identity matrix while **white balance
   keeps applying either way** (only the matrix stage is affected). Separately,
-  `CinePlayerCore` also has an automatic `CalibrationPlausibility` heuristic
-  that vetoes a calibration when applying it measurably pushes a frame's own
-  bulk statistics away from neutral — but that check is currently wired only
-  into the `cine-diagnostic` CLI tool, not into the main app's
-  `CineDocumentModel`, so in the GUI the manual toggle is the only recourse
-  today.
+  `CinePlayerCore` also has an automatic `CalibrationPlausibility` heuristic,
+  wired into both the `cine-diagnostic` CLI tool and the main app's
+  `CineDocumentModel`, that vetoes a calibration when applying it either
+  measurably pushes a frame's own bulk statistics away from neutral on
+  average, or drives a substantial fraction of individual sampled locations
+  into a clamped-to-black channel even while passing on average. A vetoed
+  calibration falls back to a generic, scene-independent correction (or, for
+  cameras this project has fit a real per-camera replacement for by serial
+  number, that camera's own regression-derived fallback) rather than to raw,
+  uncorrected sensor data.
 - **P12L (12-bit packed) pixel unpacking is unverified against real data.**
   The bit-unpacking logic is ported from a working open-source reference and
   looks correct by inspection, but none of the real captures this project

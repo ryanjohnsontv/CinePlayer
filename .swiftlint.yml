@@ -1,30 +1,6 @@
-# SwiftLint configuration for CinePlayer.
-#
-# Deliberately lenient: this repo's existing style leans on unusually long,
-# thorough doc comments (see README's "Development notes") and, in the
-# pixel-math/DNG-writer code (CinePlayerCore/Sources/CinePlayerCore/Rendering/
-# ExposureUniforms.swift, CinePlayerApp/CinePlayerApp/Support/DNGExporter.swift),
-# conventionally short math identifiers (x, y, r, g, b, v, i, n, d, le, mx, mn,
-# wb, bl, rX, rY, bX, bY, ...). Default SwiftLint settings flag both of those
-# as violations on every existing file, which would drown out real signal —
-# so both are relaxed/disabled below rather than left to spam CI on legitimate,
-# already-reviewed code. The goal is a lint job that catches genuinely new
-# problems going forward, not one that re-litigates the current codebase.
-
 disabled_rules:
-  # SwiftUI's idiomatic `Button(action: { ... }) { label }` shape is exactly
-  # "two closures, one trailing" — this rule flags that pattern throughout
-  # PlaybackToolbar.swift even though it's the standard, readable SwiftUI
-  # style, not a code smell.
   - multiple_closures_with_trailing_closure
-  # This codebase consistently uses trailing commas in multi-line array/
-  # tuple literals (DNGExporter.swift's IFD tables, KeyEventCoordinator.swift's
-  # key-set literals) as a deliberate style for cleaner future diffs.
   - trailing_comma
-  # Pixel-math and binary-format code (DNG/TIFF field packing, gradient
-  # demosaic math) leans hard on short, conventional names (x, y, r, g, b,
-  # v, i, n, d) that are clearer in context than verbose alternatives would
-  # be. Not worth relaxing to a specific length/allowlist — just off.
   - identifier_name
 
 line_length:
@@ -38,6 +14,7 @@ line_length:
 file_length:
   warning: 600
   error: 1000
+  ignore_comment_only_lines: true
 
 function_body_length:
   warning: 60
@@ -50,6 +27,10 @@ cyclomatic_complexity:
 large_tuple:
   warning: 3
   error: 4
+
+inclusive_language:
+  override_allowed_terms:
+    - master
 
 excluded:
   - "**/.build"

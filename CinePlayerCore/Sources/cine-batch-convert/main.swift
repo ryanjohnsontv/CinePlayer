@@ -130,37 +130,13 @@ func parseArguments(_ arguments: [String]) throws -> Options {
 /// standalone CLI tools (`cine-diagnostic`/`wb-verify`) — `finishWriting`
 /// uses the completion-handler overload plus a semaphore instead of the
 /// `async` variant `VideoExportCoordinator` uses in its own `Task` context.
-func convert(inputURL: URL, outputURL: URL, options: Options, device: MTLDevice, renderer: CineRenderer) throws {
-    let cineFile = try CineFile(url: inputURL)
-    guard cineFile.frameCount > 0 else { throw BatchConvertError.emptyFile }
-
-    let firstFrame = try cineFile.decodeFrame(at: 0)
-    // Same convenience initializer cine-diagnostic already uses — it
-    // applies CalibrationPlausibility.vetoedCalibration internally, so
-    // this gets the same "don't trust an implausible recorded calibration"
-    // protection the live app's own open(url:) applies, with no separate
-    // call needed here.
-    let uniforms = ExposureUniforms(setup: cineFile.setup, frame: firstFrame, debayerMode: .highQuality)
-
-    let fps = options.fpsOverride
-        ?? cineFile.setup.pbRate.map(Double.init).flatMap { $0 > 0 ? $0 : nil }
-        ?? 30
-
-    let (width, height) = VideoExportSizing.outputSize(
-        nativeWidth: cineFile.bitmapInfo.width,
-        nativeHeight: cineFile.bitmapInfo.height,
-        maxDimension: options.maxDimension
-    )
-
-    let targetDescriptor = MTLTextureDescriptor.texture2DDescriptor(
-        pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
-    )
-    targetDescriptor.usage = [.renderTarget, .shaderRead]
-    targetDescriptor.storageMode = .managed
-    guard let targetTexture = device.makeTexture(descriptor: targetDescriptor) else {
-        throw BatchConvertError.textureCreationFailed
-    }
-
+/// Creates and starts an `AVAssetWriter` (plus its video input/pixel-buffer
+/// adaptor) for `outputURL` — the writer-setup third of `convert(...)`,
+/// pulled out on its own purely to keep that function's own body short
+/// enough to read at a glance; no behavior differs from having it inline.
+func makeAssetWriter(
+    outputURL: URL, options: Options, width: Int, height: Int
+) throws -> (writer: AVAssetWriter, input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor) {
     // Always start from a clean file, matching VideoExportCoordinator —
     // AVAssetWriter itself refuses to write over an existing file.
     try? FileManager.default.removeItem(at: outputURL)
@@ -198,33 +174,55 @@ func convert(inputURL: URL, outputURL: URL, options: Options, device: MTLDevice,
     guard writer.startWriting() else { throw BatchConvertError.startWritingFailed(writer.error) }
     writer.startSession(atSourceTime: .zero)
 
-    // Fixed, generously-fine timescale rather than deriving one from `fps`
-    // directly (which may be fractional, e.g. 23.976) — every presentation
-    // time is a fraction of this, so no rounding drift accumulates frame
-    // over frame the way repeatedly adding a rounded per-frame duration
-    // would. Matches VideoExportCoordinator exactly.
-    let timescale: Int32 = 6000
+    return (writer, input, adaptor)
+}
+
+/// Bundles `encodeFrames(_:)`'s inputs into one value purely to keep that
+/// function down to a single parameter (`function_parameter_count`) — not a
+/// reusable abstraction elsewhere, just this one call site's own inputs.
+struct FrameEncodingContext {
+    let cineFile: CineFile
+    let firstFrame: DecodedFrame
+    let uniforms: ExposureUniforms
+    let device: MTLDevice
+    let renderer: CineRenderer
+    let targetTexture: MTLTexture
+    let writer: AVAssetWriter
+    let input: AVAssetWriterInput
+    let adaptor: AVAssetWriterInputPixelBufferAdaptor
+    let width: Int
+    let height: Int
+    let fps: Double
+    let timescale: Int32
+}
+
+/// Renders, encodes, and appends every frame of `cineFile` to `adaptor`/
+/// `input` in order — the per-frame work loop third of `convert(...)`,
+/// pulled out on its own purely to keep that function's own body short
+/// enough to read at a glance; no behavior differs from having it inline.
+func encodeFrames(_ context: FrameEncodingContext) throws {
+    let (cineFile, width, height) = (context.cineFile, context.width, context.height)
     let bytesPerRow = width * 4
 
     for frameIndex in 0..<cineFile.frameCount {
-        let frame = frameIndex == 0 ? firstFrame : try cineFile.decodeFrame(at: frameIndex)
-        let rawTexture = try makeFrameTexture(device: device, frame: frame)
+        let frame = frameIndex == 0 ? context.firstFrame : try cineFile.decodeFrame(at: frameIndex)
+        let rawTexture = try makeFrameTexture(device: context.device, frame: frame)
 
-        guard let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
+        guard let commandBuffer = context.renderer.commandQueue.makeCommandBuffer() else {
             throw BatchConvertError.commandBufferCreationFailed
         }
-        renderer.render(rawTexture: rawTexture, uniforms: uniforms, into: commandBuffer, colorAttachment: targetTexture)
+        context.renderer.render(rawTexture: rawTexture, uniforms: context.uniforms, into: commandBuffer, colorAttachment: context.targetTexture)
         guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
             throw BatchConvertError.blitEncoderCreationFailed
         }
-        blitEncoder.synchronize(resource: targetTexture)
+        blitEncoder.synchronize(resource: context.targetTexture)
         blitEncoder.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
 
         var pixelData = [UInt8](repeating: 0, count: bytesPerRow * height)
         pixelData.withUnsafeMutableBytes { buffer in
-            targetTexture.getBytes(
+            context.targetTexture.getBytes(
                 buffer.baseAddress!,
                 bytesPerRow: bytesPerRow,
                 from: MTLRegionMake2D(0, 0, width, height),
@@ -232,10 +230,10 @@ func convert(inputURL: URL, outputURL: URL, options: Options, device: MTLDevice,
             )
         }
 
-        while !input.isReadyForMoreMediaData {
+        while !context.input.isReadyForMoreMediaData {
             Thread.sleep(forTimeInterval: 0.005)
         }
-        guard let pool = adaptor.pixelBufferPool else { throw BatchConvertError.pixelBufferPoolUnavailable }
+        guard let pool = context.adaptor.pixelBufferPool else { throw BatchConvertError.pixelBufferPoolUnavailable }
         var pixelBufferOut: CVPixelBuffer?
         let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBufferOut)
         guard status == kCVReturnSuccess, let pixelBuffer = pixelBufferOut else {
@@ -259,15 +257,63 @@ func convert(inputURL: URL, outputURL: URL, options: Options, device: MTLDevice,
         }
         CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
 
-        let time = CMTime(value: Int64((Double(frameIndex) * Double(timescale) / fps).rounded()), timescale: timescale)
-        guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
-            throw BatchConvertError.appendFailed(writer.error)
+        let time = CMTime(value: Int64((Double(frameIndex) * Double(context.timescale) / context.fps).rounded()), timescale: context.timescale)
+        guard context.adaptor.append(pixelBuffer, withPresentationTime: time) else {
+            throw BatchConvertError.appendFailed(context.writer.error)
         }
 
         if frameIndex % 100 == 0 || frameIndex == cineFile.frameCount - 1 {
             print("  frame \(frameIndex + 1)/\(cineFile.frameCount)")
         }
     }
+}
+
+func convert(inputURL: URL, outputURL: URL, options: Options, device: MTLDevice, renderer: CineRenderer) throws {
+    let cineFile = try CineFile(url: inputURL)
+    guard cineFile.frameCount > 0 else { throw BatchConvertError.emptyFile }
+
+    let firstFrame = try cineFile.decodeFrame(at: 0)
+    // Same convenience initializer cine-diagnostic already uses — it
+    // applies CalibrationPlausibility.vetoedCalibration internally, so
+    // this gets the same "don't trust an implausible recorded calibration"
+    // protection the live app's own open(url:) applies, with no separate
+    // call needed here.
+    let uniforms = ExposureUniforms(cineFile: cineFile, frame: firstFrame, debayerMode: .highQuality)
+
+    let fps: Double = options.fpsOverride
+        ?? cineFile.setup.pbRate.map(Double.init).flatMap { $0 > 0 ? $0 : nil }
+        ?? 30
+
+    let (width, height) = VideoExportSizing.outputSize(
+        nativeWidth: cineFile.bitmapInfo.width,
+        nativeHeight: cineFile.bitmapInfo.height,
+        maxDimension: options.maxDimension
+    )
+
+    let targetDescriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm, width: width, height: height, mipmapped: false
+    )
+    targetDescriptor.usage = [.renderTarget, .shaderRead]
+    targetDescriptor.storageMode = .managed
+    guard let targetTexture = device.makeTexture(descriptor: targetDescriptor) else {
+        throw BatchConvertError.textureCreationFailed
+    }
+
+    let (writer, input, adaptor) = try makeAssetWriter(outputURL: outputURL, options: options, width: width, height: height)
+
+    // Fixed, generously-fine timescale rather than deriving one from `fps`
+    // directly (which may be fractional, e.g. 23.976) — every presentation
+    // time is a fraction of this, so no rounding drift accumulates frame
+    // over frame the way repeatedly adding a rounded per-frame duration
+    // would. Matches VideoExportCoordinator exactly.
+    let timescale: Int32 = 6000
+
+    try encodeFrames(FrameEncodingContext(
+        cineFile: cineFile, firstFrame: firstFrame, uniforms: uniforms,
+        device: device, renderer: renderer, targetTexture: targetTexture,
+        writer: writer, input: input, adaptor: adaptor,
+        width: width, height: height, fps: fps, timescale: timescale
+    ))
 
     input.markAsFinished()
     let semaphore = DispatchSemaphore(value: 0)
@@ -334,6 +380,6 @@ func run() throws {
 do {
     try run()
 } catch {
-    FileHandle.standardError.write("Error: \(error)\n".data(using: .utf8)!)
+    FileHandle.standardError.write(Data("Error: \(error)\n".utf8))
     exit(1)
 }

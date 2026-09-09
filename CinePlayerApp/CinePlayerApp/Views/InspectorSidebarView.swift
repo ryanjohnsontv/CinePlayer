@@ -106,6 +106,24 @@ private enum SliderColorStyle {
 /// `wbcc` from pixel statistics — a real, separate feature, not attempted
 /// here (see `CineDocumentModel.applyAutoExposure()`'s own doc comment for
 /// why "Auto" in this app is exposure-only for the same reason).
+
+/// Whole-stop Exposure Index ladder, centered on `referenceExposureIndex`.
+private enum ExposureIndexPreset: Int, CaseIterable {
+    case ei100 = 100
+    case ei200 = 200
+    case ei400 = 400
+    case ei800 = 800
+    case ei1600 = 1600
+    case ei3200 = 3200
+    case ei6400 = 6400
+
+    var ei: Float { Float(rawValue) }
+
+    var displayName: String {
+        rawValue == Int(CineDocumentModel.referenceExposureIndex) ? "\(rawValue) (neutral)" : "\(rawValue)"
+    }
+}
+
 private enum WhiteBalancePreset: String, CaseIterable {
     case tungsten = "Tungsten"
     case fluorescent = "Fluorescent"
@@ -241,7 +259,15 @@ private struct GradingSliderRow: View {
     }
 }
 
-struct InspectorSidebarView: View {
+// This view hosts every "Color Correction"/"Cine Colour"/Save/Export control
+// in one place, and has grown past the default type-length threshold as a
+// result — a real, tracked concern (splitting the grading groups below into
+// their own small subviews is a reasonable, comparatively low-risk future
+// cleanup, unlike CineDocumentModel's own case), but not something to do as
+// a drive-by structural change alongside unrelated lint cleanup, without the
+// chance to verify the split visually first. Revisit when it's actually
+// being refactored, not before.
+struct InspectorSidebarView: View { // swiftlint:disable:this type_body_length
     @ObservedObject var documentModel: CineDocumentModel
     @ObservedObject var playbackController: PlaybackController
 
@@ -334,7 +360,9 @@ struct InspectorSidebarView: View {
     /// this was added, until a user actually collapses something.
     @State private var isWhiteBalanceExpanded = true
     @State private var isGammaExpanded = true
+    @State private var isExposureIndexExpanded = true
     @State private var isGainExpanded = true
+    @State private var isToneCurveExpanded = true
     @State private var isPedestalExpanded = true
     @State private var isSaturationExpanded = true
 
@@ -413,7 +441,8 @@ struct InspectorSidebarView: View {
     /// to discover why. The toggle itself stays fully checkable/uncheckable
     /// either way; this never introduces a new disabled state.
     private var colorMatrixHelpText: String {
-        let base = "Applies the camera's post-demosaic color-correction matrix. Turn off if colors look off (white balance stays on either way) — the file's stored matrix is known to overshoot into a magenta cast on some files."
+        let base = "Applies the camera's post-demosaic color-correction matrix. Turn off if colors look off "
+            + "(white balance stays on either way) — the file's stored matrix is known to overshoot into a magenta cast on some files."
         guard documentModel.colorCalibrationVetoed else { return base }
         return base + " (currently overridden: this file's own calibration didn't look reliable on its first frame)"
     }
@@ -465,6 +494,64 @@ struct InspectorSidebarView: View {
                 documentModel.setGrading(updated)
             }
         )
+    }
+
+    private var flipVerticalBinding: Binding<Bool> {
+        Binding(
+            get: { documentModel.grading.flipVertical != 0 },
+            set: { newValue in
+                var updated = documentModel.grading
+                updated.flipVertical = newValue ? 1 : 0
+                documentModel.setGrading(updated)
+            }
+        )
+    }
+
+    private var rotationQuarterTurnsBinding: Binding<UInt32> {
+        Binding(
+            get: { documentModel.grading.rotationQuarterTurns },
+            set: { newValue in
+                var updated = documentModel.grading
+                updated.rotationQuarterTurns = newValue
+                documentModel.setGrading(updated)
+            }
+        )
+    }
+
+    @ViewBuilder
+    private var rotationSection: some View {
+        HStack {
+            Text("Rotate")
+            Spacer()
+            // .menu, not .segmented: four segments don't fit this sidebar's
+            // width without wrapping.
+            Picker("Rotate", selection: rotationQuarterTurnsBinding) {
+                Text("0°").tag(UInt32(0))
+                Text("90°").tag(UInt32(1))
+                Text("180°").tag(UInt32(2))
+                Text("270°").tag(UInt32(3))
+            }
+            .pickerStyle(.menu)
+            .labelsHidden()
+            .fixedSize()
+        }
+    }
+
+    @ViewBuilder
+    private var exposureIndexSection: some View {
+        HStack {
+            Text("Base EI")
+            Spacer()
+            Text("\(Int(CineDocumentModel.referenceExposureIndex)) ISO")
+                .foregroundStyle(.secondary)
+        }
+        Menu("Selected EI: \(Int(documentModel.exposureIndex)) ISO") {
+            ForEach(ExposureIndexPreset.allCases, id: \.self) { preset in
+                Button(preset.displayName) {
+                    documentModel.setExposureIndex(preset.ei)
+                }
+            }
+        }
     }
 
     /// Thin compatibility wrapper so every existing call site below stays
@@ -666,15 +753,36 @@ struct InspectorSidebarView: View {
 
                     Divider()
 
-                    gradingSlider("Brightness", value: gradingBinding(\.brightness), in: -0.5...0.5, defaultValue: 0, style: .gradient(Self.grayscaleGradient))
+                    gradingSlider(
+                        "Brightness", value: gradingBinding(\.brightness),
+                        in: -0.5...0.5, defaultValue: 0, style: .gradient(Self.grayscaleGradient)
+                    )
 
                     Divider()
 
                     DisclosureGroup("Gamma", isExpanded: $isGammaExpanded) {
-                        gradingSlider("Gamma", value: gradingBinding(\.gammaTrim), in: 0.2...3.0, defaultValue: 1, style: .gradient(Self.grayscaleGradient))
-                        gradingSlider("R Gamma", value: gradingBinding(\.gammaTrimR), in: -1.0...1.0, defaultValue: 0, style: .solidTint(Self.channelRed))
-                        gradingSlider("G Gamma", value: gradingBinding(\.gammaTrimG), in: -1.0...1.0, defaultValue: 0, style: .solidTint(Self.channelGreen))
-                        gradingSlider("B Gamma", value: gradingBinding(\.gammaTrimB), in: -1.0...1.0, defaultValue: 0, style: .solidTint(Self.channelBlue))
+                        gradingSlider(
+                            "Gamma", value: gradingBinding(\.gammaTrim),
+                            in: 0.2...3.0, defaultValue: 1, style: .gradient(Self.grayscaleGradient)
+                        )
+                        gradingSlider(
+                            "R Gamma", value: gradingBinding(\.gammaTrimR),
+                            in: -1.0...1.0, defaultValue: 0, style: .solidTint(Self.channelRed)
+                        )
+                        gradingSlider(
+                            "G Gamma", value: gradingBinding(\.gammaTrimG),
+                            in: -1.0...1.0, defaultValue: 0, style: .solidTint(Self.channelGreen)
+                        )
+                        gradingSlider(
+                            "B Gamma", value: gradingBinding(\.gammaTrimB),
+                            in: -1.0...1.0, defaultValue: 0, style: .solidTint(Self.channelBlue)
+                        )
+                    }
+
+                    Divider()
+
+                    DisclosureGroup("Exposure Index", isExpanded: $isExposureIndexExpanded) {
+                        exposureIndexSection
                     }
 
                     Divider()
@@ -696,32 +804,51 @@ struct InspectorSidebarView: View {
                             gradingSlider("Pedestal", value: chainedPedestalBinding, in: -0.5...0.5, defaultValue: 0)
                         } else {
                             gradingSlider("Pedestal", value: gradingBinding(\.pedestal), in: -0.5...0.5, defaultValue: 0)
-                            gradingSlider("R Pedestal", value: gradingBinding(\.pedestalR), in: -0.5...0.5, defaultValue: 0, style: .solidTint(Self.channelRed))
-                            gradingSlider("G Pedestal", value: gradingBinding(\.pedestalG), in: -0.5...0.5, defaultValue: 0, style: .solidTint(Self.channelGreen))
-                            gradingSlider("B Pedestal", value: gradingBinding(\.pedestalB), in: -0.5...0.5, defaultValue: 0, style: .solidTint(Self.channelBlue))
+                            gradingSlider(
+                                "R Pedestal", value: gradingBinding(\.pedestalR),
+                                in: -0.5...0.5, defaultValue: 0, style: .solidTint(Self.channelRed)
+                            )
+                            gradingSlider(
+                                "G Pedestal", value: gradingBinding(\.pedestalG),
+                                in: -0.5...0.5, defaultValue: 0, style: .solidTint(Self.channelGreen)
+                            )
+                            gradingSlider(
+                                "B Pedestal", value: gradingBinding(\.pedestalB),
+                                in: -0.5...0.5, defaultValue: 0, style: .solidTint(Self.channelBlue)
+                            )
                         }
                     }
 
                     Divider()
 
                     DisclosureGroup("Saturation & Hue", isExpanded: $isSaturationExpanded) {
-                        gradingSlider("Saturation", value: gradingBinding(\.saturation), in: 0...2, defaultValue: 1, style: .gradient(Self.saturationGradient))
+                        gradingSlider(
+                            "Saturation", value: gradingBinding(\.saturation),
+                            in: 0...2, defaultValue: 1, style: .gradient(Self.saturationGradient)
+                        )
                         gradingSlider("Hue", value: gradingBinding(\.hue), in: -180...180, defaultValue: 0, style: .gradient(Self.hueGradient))
+                    }
+
+                    Divider()
+
+                    DisclosureGroup("Tone Curve", isExpanded: $isToneCurveExpanded) {
+                        ToneCurveEditorView(documentModel: documentModel)
                     }
 
                     Divider()
 
                     Toggle("Flip Horizontal", isOn: flipHorizontalBinding)
                         .toggleStyle(.checkbox)
+                    Toggle("Flip Vertical", isOn: flipVerticalBinding)
+                        .toggleStyle(.checkbox)
+                    rotationSection
 
                     Button("Reset to Defaults") {
                         documentModel.setGrading(.identity)
-                        // Color Temp/WBCC live outside `GradingUniforms` (see
-                        // above), so `setGrading(.identity)` alone can't
-                        // reset them — this button still resets everything
-                        // in the section, not just the phase-1 fields.
                         documentModel.setColorTemp(6500)
                         documentModel.setWBCC(0)
+                        documentModel.setExposureIndex(CineDocumentModel.referenceExposureIndex)
+                        documentModel.resetToneCurves()
                     }
                 }
                 .padding(12)
@@ -769,6 +896,7 @@ struct InspectorSidebarView: View {
         // without waiting for something to change first.
         .onChange(of: playbackController.currentFrameIndex) { _, _ in scheduleHistogramRecompute() }
         .onChange(of: documentModel.grading) { _, _ in scheduleHistogramRecompute() }
+        .onChange(of: documentModel.toneCurves) { _, _ in scheduleHistogramRecompute() }
         .onChange(of: documentModel.colorTempKelvin) { _, _ in scheduleHistogramRecompute() }
         .onChange(of: documentModel.wbcc) { _, _ in scheduleHistogramRecompute() }
         .onChange(of: documentModel.uniforms.debayerMode) { _, _ in scheduleHistogramRecompute() }

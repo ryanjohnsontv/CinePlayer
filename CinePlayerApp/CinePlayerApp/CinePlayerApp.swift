@@ -237,7 +237,8 @@ struct CinePlayerApp: App {
     private static func presentMetalUnavailableAlertAndExit() -> Never {
         let alert = NSAlert()
         alert.messageText = "Metal Is Required"
-        alert.informativeText = "CinePlayer requires a Mac with a Metal-capable GPU. No such GPU could be found on this Mac, so CinePlayer cannot run."
+        alert.informativeText = "CinePlayer requires a Mac with a Metal-capable GPU. "
+            + "No such GPU could be found on this Mac, so CinePlayer cannot run."
         alert.alertStyle = .critical
         alert.addButton(withTitle: "Quit")
         alert.runModal()

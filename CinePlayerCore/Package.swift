@@ -10,9 +10,13 @@ let package = Package(
         .executable(name: "cine-scrub-bench", targets: ["cine-scrub-bench"]),
         .executable(name: "cine-lut-verify", targets: ["cine-lut-verify"]),
         .executable(name: "cine-batch-convert", targets: ["cine-batch-convert"]),
+        .executable(name: "wb-verify", targets: ["wb-verify"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/ryanjohnsontv/CineKit.git", from: "0.1.0"),
+        // 0.1.1, not 0.1.0: CineDocumentModel/ExposureUniforms rely on
+        // CineFile.effectiveBlackWhiteLevels, which doesn't exist before
+        // the P10-linearization fix that version shipped.
+        .package(url: "https://github.com/ryanjohnsontv/CineKit.git", from: "0.1.1"),
     ],
     targets: [
         .plugin(

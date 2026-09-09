@@ -114,7 +114,7 @@ func run() throws {
 
     let rawTexture = try makeFrameTexture(device: device, frame: frame)
 
-    let uniforms = ExposureUniforms(setup: cineFile.setup, frame: frame, debayerMode: mode)
+    let uniforms = ExposureUniforms(cineFile: cineFile, frame: frame, debayerMode: mode)
 
     // Render OFFSCREEN through the exact same CineRenderer function the GUI
     // uses — into a private bgra8Unorm texture of the frame's dimensions.
@@ -172,6 +172,6 @@ func run() throws {
 do {
     try run()
 } catch {
-    FileHandle.standardError.write("Error: \(error)\n".data(using: .utf8)!)
+    FileHandle.standardError.write(Data("Error: \(error)\n".utf8))
     exit(1)
 }

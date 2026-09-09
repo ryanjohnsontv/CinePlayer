@@ -2,7 +2,6 @@ import AppKit
 @preconcurrency import AVFoundation
 @preconcurrency import CoreVideo
 @preconcurrency import Metal
-import UniformTypeIdentifiers
 import CinePlayerCore
 
 // `VideoCodecOption`/`VideoResolutionOption` now live in CinePlayerCore
@@ -152,6 +151,186 @@ enum VideoExportCoordinator {
 
     // MARK: - Encoding
 
+    /// Creates and starts an `AVAssetWriter` (plus its video input/pixel-
+    /// buffer adaptor) for `url` — the writer-setup third of
+    /// `performExport(...)`, pulled out on its own purely to keep that
+    /// function's own body short enough to read at a glance; no behavior
+    /// differs from having it inline. Returns `nil` after already
+    /// presenting the appropriate alert if any step fails, so the caller
+    /// only needs to check for `nil` and return.
+    private static func makeAssetWriter(
+        url: URL, options: ExportOptions, width: Int, height: Int
+    ) -> (writer: AVAssetWriter, input: AVAssetWriterInput, adaptor: AVAssetWriterInputPixelBufferAdaptor)? {
+        // Always start from a clean file — `NSSavePanel` already confirmed
+        // any overwrite with the user before returning, and `AVAssetWriter`
+        // itself refuses to write over an existing file.
+        try? FileManager.default.removeItem(at: url)
+
+        let writer: AVAssetWriter
+        do {
+            writer = try AVAssetWriter(outputURL: url, fileType: .mov)
+        } catch {
+            presentErrorAlert(VideoExportError.writerCreationFailed(error))
+            return nil
+        }
+
+        let outputSettings: [String: Any] = [
+            AVVideoCodecKey: options.codec.avCodecType,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+            AVVideoColorPropertiesKey: [
+                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
+                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
+                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
+            ],
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
+        input.expectsMediaDataInRealTime = false
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
+            assetWriterInput: input,
+            sourcePixelBufferAttributes: [
+                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+                kCVPixelBufferWidthKey as String: width,
+                kCVPixelBufferHeightKey as String: height,
+            ]
+        )
+
+        guard writer.canAdd(input) else {
+            presentErrorAlert(VideoExportError.cannotAddInput)
+            return nil
+        }
+        writer.add(input)
+        guard writer.startWriting() else {
+            presentErrorAlert(VideoExportError.startWritingFailed(writer.error))
+            return nil
+        }
+        writer.startSession(atSourceTime: .zero)
+
+        return (writer, input, adaptor)
+    }
+
+    /// Bundles `encodeFrames(_:)`'s inputs into one value purely to keep that
+    /// function down to a single parameter (`function_parameter_count`) —
+    /// not a reusable abstraction elsewhere, just this one call site's own
+    /// inputs.
+    private struct FrameEncodingContext {
+        let range: ClosedRange<Int>
+        let url: URL
+        let options: ExportOptions
+        let documentModel: CineDocumentModel
+        let renderer: CineRenderer
+        let targetTexture: MTLTexture
+        let writer: AVAssetWriter
+        let input: AVAssetWriterInput
+        let adaptor: AVAssetWriterInputPixelBufferAdaptor
+        let width: Int
+        let height: Int
+        let timescale: Int32
+        let progress: MediaExportProgress
+    }
+
+    /// Renders, encodes, and appends every frame in `context.range` to
+    /// `context.adaptor`/`context.input`, updating `context.progress` as it
+    /// goes — the per-frame work loop third of `performExport(...)`, pulled
+    /// out on its own purely to keep that function's own body short enough
+    /// to read at a glance; no behavior differs from having it inline.
+    /// Returns `true` if a per-frame error occurred (already alerted and
+    /// cleaned up its own partial output file) — the caller must return
+    /// immediately without its own normal finish/status path. Returns
+    /// `false` if the loop ran to completion or was cancelled, either of
+    /// which the caller should follow with its own normal finish.
+    private static func encodeFrames(_ context: FrameEncodingContext) async -> Bool {
+        let (documentModel, renderer, targetTexture) = (context.documentModel, context.renderer, context.targetTexture)
+        let (width, height) = (context.width, context.height)
+
+        for (offset, frameIndex) in context.range.enumerated() {
+            if Task.isCancelled { break }
+
+            do {
+                let rawTexture = try await documentModel.texture(at: frameIndex)
+                guard let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
+                    throw VideoExportError.commandBufferCreationFailed
+                }
+                renderer.render(
+                    rawTexture: rawTexture,
+                    uniforms: documentModel.uniforms,
+                    into: commandBuffer,
+                    colorAttachment: targetTexture,
+                    lutTexture: documentModel.currentLUTTexture,
+                    grading: documentModel.grading,
+                    toneCurveTextures: documentModel.toneCurveTextures
+                )
+                guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
+                    throw VideoExportError.blitEncoderCreationFailed
+                }
+                blitEncoder.synchronize(resource: targetTexture)
+                blitEncoder.endEncoding()
+                commandBuffer.commit()
+                await commandBuffer.completed()
+
+                let bytesPerRow = width * 4
+                var pixelData = [UInt8](repeating: 0, count: bytesPerRow * height)
+                pixelData.withUnsafeMutableBytes { buffer in
+                    targetTexture.getBytes(
+                        buffer.baseAddress!,
+                        bytesPerRow: bytesPerRow,
+                        from: MTLRegionMake2D(0, 0, width, height),
+                        mipmapLevel: 0
+                    )
+                }
+
+                while !context.input.isReadyForMoreMediaData {
+                    try await Task.sleep(for: .milliseconds(5))
+                }
+                guard let pool = context.adaptor.pixelBufferPool else {
+                    throw VideoExportError.pixelBufferPoolUnavailable
+                }
+                let pixelBuffer = try makePixelBuffer(from: pixelData, bytesPerRow: bytesPerRow, height: height, pool: pool)
+
+                let timeValue = Int64((Double(offset) * Double(context.timescale) / context.options.frameRate).rounded())
+                let time = CMTime(value: timeValue, timescale: context.timescale)
+                guard context.adaptor.append(pixelBuffer, withPresentationTime: time) else {
+                    throw VideoExportError.appendFailed(context.writer.error)
+                }
+            } catch {
+                presentErrorAlert(error)
+                context.input.markAsFinished()
+                await context.writer.finishWriting()
+                try? FileManager.default.removeItem(at: context.url)
+                return true
+            }
+
+            context.progress.currentFrame = offset + 1
+        }
+        return false
+    }
+
+    private static func makePixelBuffer(from pixelData: [UInt8], bytesPerRow: Int, height: Int, pool: CVPixelBufferPool) throws -> CVPixelBuffer {
+        var pixelBufferOut: CVPixelBuffer?
+        let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBufferOut)
+        guard status == kCVReturnSuccess, let pixelBuffer = pixelBufferOut else {
+            throw VideoExportError.pixelBufferCreationFailed(status)
+        }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
+        let destBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
+        pixelData.withUnsafeBytes { src in
+            let srcBase = src.baseAddress!
+            if destBytesPerRow == bytesPerRow {
+                memcpy(base, srcBase, bytesPerRow * height)
+            } else {
+                // The pool's own pixel buffer padded each row to a
+                // different stride than our tightly-packed readback — copy
+                // row by row instead of assuming they match.
+                for row in 0..<height {
+                    memcpy(base.advanced(by: row * destBytesPerRow), srcBase.advanced(by: row * bytesPerRow), bytesPerRow)
+                }
+            }
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+        return pixelBuffer
+    }
+
     private static func performExport(
         url: URL,
         options: ExportOptions,
@@ -189,50 +368,9 @@ enum VideoExportCoordinator {
             return
         }
 
-        // Always start from a clean file — `NSSavePanel` already confirmed
-        // any overwrite with the user before returning, and `AVAssetWriter`
-        // itself refuses to write over an existing file.
-        try? FileManager.default.removeItem(at: url)
-
-        let writer: AVAssetWriter
-        do {
-            writer = try AVAssetWriter(outputURL: url, fileType: .mov)
-        } catch {
-            presentErrorAlert(VideoExportError.writerCreationFailed(error))
+        guard let (writer, input, adaptor) = makeAssetWriter(url: url, options: options, width: width, height: height) else {
             return
         }
-
-        let outputSettings: [String: Any] = [
-            AVVideoCodecKey: options.codec.avCodecType,
-            AVVideoWidthKey: width,
-            AVVideoHeightKey: height,
-            AVVideoColorPropertiesKey: [
-                AVVideoColorPrimariesKey: AVVideoColorPrimaries_ITU_R_709_2,
-                AVVideoTransferFunctionKey: AVVideoTransferFunction_ITU_R_709_2,
-                AVVideoYCbCrMatrixKey: AVVideoYCbCrMatrix_ITU_R_709_2,
-            ],
-        ]
-        let input = AVAssetWriterInput(mediaType: .video, outputSettings: outputSettings)
-        input.expectsMediaDataInRealTime = false
-        let adaptor = AVAssetWriterInputPixelBufferAdaptor(
-            assetWriterInput: input,
-            sourcePixelBufferAttributes: [
-                kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
-                kCVPixelBufferWidthKey as String: width,
-                kCVPixelBufferHeightKey as String: height,
-            ]
-        )
-
-        guard writer.canAdd(input) else {
-            presentErrorAlert(VideoExportError.cannotAddInput)
-            return
-        }
-        writer.add(input)
-        guard writer.startWriting() else {
-            presentErrorAlert(VideoExportError.startWritingFailed(writer.error))
-            return
-        }
-        writer.startSession(atSourceTime: .zero)
 
         // A fixed, generously-fine timescale rather than deriving one from
         // `options.frameRate` directly (which may be fractional, e.g.
@@ -241,85 +379,12 @@ enum VideoExportCoordinator {
         // way repeatedly adding a rounded per-frame duration would.
         let timescale: Int32 = 6000
 
-        for (offset, frameIndex) in range.enumerated() {
-            if Task.isCancelled { break }
-
-            do {
-                let rawTexture = try await documentModel.texture(at: frameIndex)
-                guard let commandBuffer = renderer.commandQueue.makeCommandBuffer() else {
-                    throw VideoExportError.commandBufferCreationFailed
-                }
-                renderer.render(
-                    rawTexture: rawTexture,
-                    uniforms: documentModel.uniforms,
-                    into: commandBuffer,
-                    colorAttachment: targetTexture,
-                    lutTexture: documentModel.currentLUTTexture,
-                    grading: documentModel.grading
-                )
-                guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
-                    throw VideoExportError.blitEncoderCreationFailed
-                }
-                blitEncoder.synchronize(resource: targetTexture)
-                blitEncoder.endEncoding()
-                commandBuffer.commit()
-                await commandBuffer.completed()
-
-                let bytesPerRow = width * 4
-                var pixelData = [UInt8](repeating: 0, count: bytesPerRow * height)
-                pixelData.withUnsafeMutableBytes { buffer in
-                    targetTexture.getBytes(
-                        buffer.baseAddress!,
-                        bytesPerRow: bytesPerRow,
-                        from: MTLRegionMake2D(0, 0, width, height),
-                        mipmapLevel: 0
-                    )
-                }
-
-                while !input.isReadyForMoreMediaData {
-                    try await Task.sleep(for: .milliseconds(5))
-                }
-                guard let pool = adaptor.pixelBufferPool else {
-                    throw VideoExportError.pixelBufferPoolUnavailable
-                }
-                var pixelBufferOut: CVPixelBuffer?
-                let status = CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pixelBufferOut)
-                guard status == kCVReturnSuccess, let pixelBuffer = pixelBufferOut else {
-                    throw VideoExportError.pixelBufferCreationFailed(status)
-                }
-                CVPixelBufferLockBaseAddress(pixelBuffer, [])
-                let base = CVPixelBufferGetBaseAddress(pixelBuffer)!
-                let destBytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer)
-                pixelData.withUnsafeBytes { src in
-                    let srcBase = src.baseAddress!
-                    if destBytesPerRow == bytesPerRow {
-                        memcpy(base, srcBase, bytesPerRow * height)
-                    } else {
-                        // The pool's own pixel buffer padded each row to a
-                        // different stride than our tightly-packed
-                        // readback — copy row by row instead of assuming
-                        // they match.
-                        for row in 0..<height {
-                            memcpy(base.advanced(by: row * destBytesPerRow), srcBase.advanced(by: row * bytesPerRow), bytesPerRow)
-                        }
-                    }
-                }
-                CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
-
-                let time = CMTime(value: Int64((Double(offset) * Double(timescale) / options.frameRate).rounded()), timescale: timescale)
-                guard adaptor.append(pixelBuffer, withPresentationTime: time) else {
-                    throw VideoExportError.appendFailed(writer.error)
-                }
-            } catch {
-                presentErrorAlert(error)
-                input.markAsFinished()
-                await writer.finishWriting()
-                try? FileManager.default.removeItem(at: url)
-                return
-            }
-
-            progress.currentFrame = offset + 1
-        }
+        let hadPerFrameError = await encodeFrames(FrameEncodingContext(
+            range: range, url: url, options: options, documentModel: documentModel, renderer: renderer,
+            targetTexture: targetTexture, writer: writer, input: input, adaptor: adaptor,
+            width: width, height: height, timescale: timescale, progress: progress
+        ))
+        if hadPerFrameError { return }
 
         input.markAsFinished()
         await writer.finishWriting()

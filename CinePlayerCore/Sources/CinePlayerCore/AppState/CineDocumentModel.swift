@@ -46,8 +46,17 @@ public enum CineDocumentModelError: Error, CustomStringConvertible {
     }
 }
 
+// This type has genuinely grown into a God-object candidate (file lifecycle,
+// grading, zoom, save/trim, white balance, and file-cache priming all live
+// here) — a real, tracked concern, not something to silence blindly. Splitting
+// it out (e.g. a separate grading-state type) is real, non-trivial surgery on
+// a type nothing in this repo currently has direct test coverage for, so it's
+// deliberately not being done as a drive-by fix alongside unrelated lint
+// cleanup. Revisit when it's actually being refactored, not before.
+//
+// swiftlint:disable file_length
 @MainActor
-public final class CineDocumentModel: ObservableObject {
+public final class CineDocumentModel: ObservableObject { // swiftlint:disable:this type_body_length
     public let device: MTLDevice
 
     @Published public private(set) var currentURL: URL?
@@ -80,10 +89,12 @@ public final class CineDocumentModel: ObservableObject {
     /// arbitrary window shape. Falls back to 16:9 before any file is open
     /// (`frameWidth`/`frameHeight` are still 0 then) — an arbitrary but
     /// harmless default since nothing sizes against it until a real file's
-    /// dimensions are known.
+    /// dimensions are known. Inverted for a 90°/270° rotation.
     public var videoAspectRatio: CGFloat {
         guard frameWidth > 0, frameHeight > 0 else { return 16.0 / 9.0 }
-        return CGFloat(frameWidth) / CGFloat(frameHeight)
+        let unrotated = CGFloat(frameWidth) / CGFloat(frameHeight)
+        let isQuarterTurned = grading.rotationQuarterTurns == 1 || grading.rotationQuarterTurns == 3
+        return isQuarterTurned ? 1 / unrotated : unrotated
     }
 
     /// Zoom multiplier applied to the video viewport, on top of "fit" (the
@@ -371,6 +382,12 @@ public final class CineDocumentModel: ObservableObject {
     /// comments.
     @Published public private(set) var wbcc: Float = 0
 
+    /// The active Exposure Index, mapped to `GradingUniforms.exposureIndexGain`.
+    /// `.cine` files don't record a base ISO, so `referenceExposureIndex`
+    /// (800, ARRI Alexa's base EI) is a chosen neutral reference. Reset to
+    /// neutral on every `open(url:)`.
+    @Published public private(set) var exposureIndex: Float = CineDocumentModel.referenceExposureIndex
+
     /// Whether the currently-open file's own recorded calibration
     /// (`CineSetup.colorCalibration`) was automatically overridden to
     /// identity at `open(url:)` time, because `CalibrationPlausibility`
@@ -495,6 +512,13 @@ public final class CineDocumentModel: ObservableObject {
     /// deliberate, not an inconsistency.
     @Published public private(set) var recentLUTURLs: [URL] = []
 
+    /// The active "Cine Colour" tone curves. Reset on every `open(url:)`.
+    @Published public private(set) var toneCurves: ToneCurveSet = .identity
+
+    /// The Metal textures built from `toneCurves`, read by
+    /// `CineMetalView.Coordinator` and passed to `CineRenderer.render(...)`.
+    @Published public private(set) var toneCurveTextures: ToneCurveTextureSet?
+
     /// The active `VideoExportCoordinator.exportVideo` run's progress, or
     /// `nil` when no export is in flight — `ExportProgressSheet` is shown
     /// exactly when this is non-`nil` (see `ContentView`'s `.sheet`).
@@ -535,6 +559,34 @@ public final class CineDocumentModel: ObservableObject {
     /// overlay treats both `nil` and `""` as "omit the row" rather than
     /// showing a blank/placeholder value.
     @Published public private(set) var cameraModel: String?
+
+    /// The open file's camera serial number (`CineSetup.serial`), or `nil`
+    /// if absent. A real, independently-recorded field distinct from
+    /// `cameraModel` — a file can (and, empirically, often does) carry one
+    /// without the other, so this is tracked separately rather than folded
+    /// into `cameraModel` itself. See `cameraIdentifierForDisplay` for the
+    /// single string the overlay actually shows.
+    @Published public private(set) var cameraSerial: UInt32?
+
+    /// What to show for "which camera shot this" in the metadata overlay —
+    /// `cameraModel` when it's actually present and non-empty, else a
+    /// serial-number fallback when at least that's present, else `nil`
+    /// (omit the row entirely) when neither field was recorded. Camera
+    /// model absent-or-empty is the common case in practice (see
+    /// `cameraModel`'s own doc comment), so without this fallback most
+    /// real files would show no camera identification at all even when
+    /// the file does carry *some* — the serial can't name the model, but
+    /// it's still real, useful camera-identifying data worth surfacing
+    /// rather than omitting just because the fuller field is blank.
+    public var cameraIdentifierForDisplay: String? {
+        if let cameraModel, !cameraModel.isEmpty {
+            return cameraModel
+        }
+        if let cameraSerial {
+            return "Camera Serial #\(cameraSerial)"
+        }
+        return nil
+    }
 
     /// Human-readable label for the open file's pixel-data compression
     /// (`BitmapInfoHeader.compression`) — e.g. "Uncompressed"/"P10"/"P12L"
@@ -853,16 +905,41 @@ public final class CineDocumentModel: ObservableObject {
     /// WBCC (white-balance color-correction, the green/magenta axis)'s
     /// multiplier — applied ONLY to the green channel's combined gain;
     /// red/blue are untouched by this control. Interpreted as a
-    /// percentage-like green-channel shift (`1 + wbcc / 100`): no
+    /// percentage-like green-channel shift (`1 - wbcc / 100`): no
     /// authoritative source publishes Vision Research's own exact WBCC
     /// scale, so this is a reasonable, clearly-documented interpretation
     /// given the reference material this whole panel is modeled on — not
     /// presented as certainly correct. (Its own documented example value,
     /// 17.743, is a plausible real value under this reading — roughly an
-    /// 18% green push.) By construction, `wbccMultiplier(0) == 1` exactly, a
-    /// true no-op.
+    /// 18% green cut, i.e. a magenta push.) Negative sign (not `1 +
+    /// wbcc / 100`) so positive `wbcc` — the slider's magenta-labeled end,
+    /// see `InspectorSidebarView.wbccGradient` — actually reduces green
+    /// gain (pushing toward magenta) rather than increasing it: an earlier
+    /// version of this formula had the sign backwards, moving the image
+    /// toward green when the slider was dragged toward magenta and vice
+    /// versa. By construction, `wbccMultiplier(0) == 1` exactly, a true
+    /// no-op either way.
     private static func wbccMultiplier(_ wbcc: Float) -> Float {
-        1 + wbcc / 100
+        1 - wbcc / 100
+    }
+
+    /// The neutral EI reference (ARRI Alexa's base EI). `nonisolated` so
+    /// non-`@MainActor` callers like `ExposureIndexPreset` can read it.
+    public nonisolated static let referenceExposureIndex: Float = 800
+
+    /// A doubling of EI is +1 stop (2x linear gain).
+    private static func exposureIndexMultiplier(_ ei: Float) -> Float {
+        ei / referenceExposureIndex
+    }
+
+    /// `CineSetup.rotationDegrees` is signed and counterclockwise-positive;
+    /// `GradingUniforms.rotationQuarterTurns` is clockwise quarter-turns.
+    private static func rotationQuarterTurns(forFileRotationDegrees degrees: Int32?) -> UInt32 {
+        switch degrees {
+        case 90: return 3
+        case -90: return 1
+        default: return 0
+        }
     }
 
     public init(device: MTLDevice) {
@@ -952,7 +1029,7 @@ public final class CineDocumentModel: ObservableObject {
         // `PlaybackController.playRealTime(forward:)` -- a malformed or
         // garbage stored value falls back to the same 30fps default as a
         // genuinely-absent field, rather than being trusted blindly.
-        let reviewFPS = cineFile.setup.pbRate.map(Double.init).flatMap { $0 > 0 ? $0 : nil } ?? 30
+        let reviewFPS: Double = cineFile.setup.pbRate.map(Double.init).flatMap { $0 > 0 ? $0 : nil } ?? 30
         let controller = PlaybackController(
             frameCount: cineFile.frameCount,
             cache: cache,
@@ -961,13 +1038,13 @@ public final class CineDocumentModel: ObservableObject {
             firstImageNo: Int(cineFile.header.firstImageNo)
         )
 
-        let levels = cineFile.setup.effectiveBlackWhiteLevels
+        let levels = cineFile.effectiveBlackWhiteLevels
         let cfaPhase = CFAPhase.forCFAPattern(cineFile.setup.cfa)
         // Falls back to a no-op calibration for files without usable
         // `cmCalib` metadata — see `CineSetup.colorCalibration`'s doc
         // comment. Then run through the same automatic plausibility veto
         // `cine-diagnostic` already applies (`CalibrationPlausibility`, via
-        // `ExposureUniforms.init(setup:frame:debayerMode:)`) — using
+        // `ExposureUniforms.init(cineFile:frame:debayerMode:)`) — using
         // `firstFrame`'s real pixel data, decoded just above — so a file
         // whose recorded calibration measurably pushes its own footage away
         // from neutral falls back to identity here too, not just in the CLI
@@ -980,7 +1057,8 @@ public final class CineDocumentModel: ObservableObject {
             frame: firstFrame,
             cfaPhase: cfaPhase,
             blackLevel: Float(levels.black),
-            whiteLevel: Float(levels.white)
+            whiteLevel: Float(levels.white),
+            cameraVersion: cineFile.setup.cameraVersion
         )
         let matrixEnabled = Self.storedColorMatrixEnabled
         // `colorCalibration` is left at its `.identity` default here —
@@ -1027,43 +1105,38 @@ public final class CineDocumentModel: ObservableObject {
         self.colorCalibrationVetoed = rawCalibration != calibration
         self.colorMatrixEnabled = matrixEnabled
         self.uniforms = uniforms
-        // Every newly-opened file starts with a neutral grade, regardless of
-        // what was dialed in on whatever was open before — see `grading`'s
-        // own doc comment for why this is a deliberate asymmetry with
-        // `colorMatrixEnabled`/`storedDebayerMode` just above, not an
-        // oversight. Grading is purely live/session state: it's never
-        // written back into the `.cine` file (the format has no field for
-        // it) and never persisted to a sidecar of any kind — its only
-        // lasting effect is whatever gets baked into a still/video export
-        // while it's dialed in. `overwriteCurrentFile` below carries the
-        // current grade across its own internal reopen explicitly, since
-        // that reopen isn't the user opening a different file.
-        self.grading = .identity
-        // Same "per-shot, not a lingering app preference" reasoning as
-        // `grading` immediately above — see `colorTempKelvin`/`wbcc`'s own
-        // doc comments.
+        // Grading/tone curves/color temp/exposure are per-shot state, reset
+        // on every open rather than persisted.
+        resetPerShotState(for: cineFile)
+        applyFileMetadata(from: cineFile)
+        recordRecentFile(url)
+        revealContainingFolderIfNeeded(for: url)
+    }
+
+    private func resetPerShotState(for cineFile: CineFile) {
+        // Rotation seeds from the file's own recorded SETUP.Rotate; every
+        // other field starts neutral. Still just a starting value — the
+        // Rotate control and Reset to Defaults both freely override it.
+        var initialGrading = GradingUniforms.identity
+        initialGrading.rotationQuarterTurns = Self.rotationQuarterTurns(forFileRotationDegrees: cineFile.setup.rotationDegrees)
+        self.grading = initialGrading
+        self.toneCurves = .identity
+        self.toneCurveTextures = try? ToneCurveTextureSet.make(from: .identity, device: device)
         self.colorTempKelvin = 6500
         self.wbcc = 0
-        // Same reset-on-every-open treatment as grading/colorTempKelvin/wbcc
-        // above; see `zoomScale`'s own doc comment. Unanimated
-        // (`animated: false`): opening a file has nothing for a zoom
-        // transition to visibly settle from/to that would read as
-        // intentional, unlike a real in-place Zoom In/Out/Actual Size action.
+        self.exposureIndex = Self.referenceExposureIndex
         setZoomScale(Self.minZoomScale, animated: false)
-        // Computes the real `uniforms.wbGainR/G/B`/`colorMatrix` for this
-        // file, now that `fileColorCalibration`/`colorMatrixEnabled`/
-        // `colorTempKelvin`/`wbcc` are all set above — see
-        // `recomputeWhiteBalance()`'s own doc comment for why this is the
-        // one place that computation happens.
         recomputeWhiteBalance()
-        self.captureFrameRate = captureFrameRate
+    }
+
+    private func applyFileMetadata(from cineFile: CineFile) {
+        self.captureFrameRate = cineFile.setup.effectiveFrameRate
         self.sensorBitDepth = cineFile.setup.realBPP.map(Int.init)
         self.cfaPattern = cineFile.setup.cfa
         self.shutterNs = cineFile.setup.shutterNs
         self.cameraModel = cineFile.setup.cameraModel
+        self.cameraSerial = cineFile.setup.serial
         self.compressionLabel = Self.compressionLabel(for: cineFile.bitmapInfo.compression)
-        recordRecentFile(url)
-        revealContainingFolderIfNeeded(for: url)
     }
 
     /// Cancels whatever file-cache warm is currently in flight and starts a
@@ -1183,6 +1256,14 @@ public final class CineDocumentModel: ObservableObject {
         recomputeWhiteBalance()
     }
 
+    public func setExposureIndex(_ ei: Float) {
+        guard exposureIndex != ei else { return }
+        exposureIndex = ei
+        var updated = grading
+        updated.exposureIndexGain = Self.exposureIndexMultiplier(ei)
+        setGrading(updated)
+    }
+
     /// Sets the active "Cine Colour" grading parameters wholesale — the
     /// inspector sidebar's per-field sliders/toggles each read+write through
     /// this one setter (see `InspectorSidebarView`'s `gradingBinding` helper)
@@ -1195,6 +1276,22 @@ public final class CineDocumentModel: ObservableObject {
     public func setGrading(_ newValue: GradingUniforms) {
         guard grading != newValue else { return }
         grading = newValue
+    }
+
+    /// Only rebuilds `channel`'s own texture, not all four.
+    public func setToneCurve(_ newValue: ToneCurve, channel: ToneCurveChannel) {
+        guard toneCurves[channel] != newValue else { return }
+        guard let newTexture = try? ToneCurveTexture.make(from: newValue, device: device),
+              toneCurveTextures != nil else { return }
+        toneCurves[channel] = newValue
+        toneCurveTextures![channel] = newTexture
+    }
+
+    public func resetToneCurves() {
+        guard toneCurves != .identity else { return }
+        guard let textures = try? ToneCurveTextureSet.make(from: .identity, device: device) else { return }
+        toneCurves = .identity
+        toneCurveTextures = textures
     }
 
     /// Re-renders the current frame at a small offscreen size and rebins it
@@ -1225,7 +1322,8 @@ public final class CineDocumentModel: ObservableObject {
                 grading: grading,
                 renderer: renderer,
                 device: device,
-                lutTexture: lutEnabled ? currentLUTTexture : nil
+                lutTexture: lutEnabled ? currentLUTTexture : nil,
+                toneCurveTextures: toneCurveTextures
             )
             guard !Task.isCancelled else { return }
             currentHistogram = histogram
@@ -1343,19 +1441,6 @@ public final class CineDocumentModel: ObservableObject {
         guard lutEnabled != enabled else { return }
         lutEnabled = enabled
         uniforms.lutEnabled = (enabled && currentLUTTexture != nil) ? 1 : 0
-    }
-
-    /// Clears the currently-active LUT entirely — distinct from merely
-    /// disabling it via `setLUTEnabled(false)`, which keeps
-    /// `currentLUTTexture` around so re-enabling doesn't need a re-load.
-    /// Does not touch `recentLUTURLs`: clearing the active LUT and
-    /// forgetting it ever existed in the recent-list are two different
-    /// actions (the latter is `clearRecentLUTs()`).
-    public func clearLUT() {
-        currentLUTURL = nil
-        currentLUTTexture = nil
-        lutEnabled = false
-        uniforms.lutEnabled = 0
     }
 
     /// Records `url` as the most-recently-loaded LUT, called from the end of

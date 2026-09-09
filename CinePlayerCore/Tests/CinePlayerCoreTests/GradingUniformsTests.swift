@@ -24,5 +24,7 @@ struct GradingUniformsTests {
         #expect(identity.saturation == 1)
         #expect(identity.hue == 0)
         #expect(identity.flipHorizontal == 0)
+        #expect(identity.flipVertical == 0)
+        #expect(identity.exposureIndexGain == 1)
     }
 }

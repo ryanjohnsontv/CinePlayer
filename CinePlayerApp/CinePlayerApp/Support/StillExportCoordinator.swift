@@ -242,7 +242,8 @@ enum StillExportCoordinator {
             into: commandBuffer,
             colorAttachment: targetTexture,
             lutTexture: documentModel.currentLUTTexture,
-            grading: documentModel.grading
+            grading: documentModel.grading,
+            toneCurveTextures: documentModel.toneCurveTextures
         )
 
         guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
@@ -310,7 +311,8 @@ enum StillExportCoordinator {
             into: commandBuffer,
             colorAttachment: targetTexture,
             lutTexture: documentModel.currentLUTTexture,
-            grading: documentModel.grading
+            grading: documentModel.grading,
+            toneCurveTextures: documentModel.toneCurveTextures
         )
 
         guard let blitEncoder = commandBuffer.makeBlitCommandEncoder() else {
@@ -357,8 +359,11 @@ enum StillExportCoordinator {
         return DNGWriter.makeDNGData(cineFile: cineFile, frame: frame)
     }
 
-    // MARK: - Encoding (ImageIO)
+}
 
+// MARK: - Encoding (ImageIO)
+
+extension StillExportCoordinator {
     /// Identical byte layout/encoding to `FrameExporter`'s original `pngData`.
     private static func pngData(bgraPixels: [UInt8], width: Int, height: Int) throws -> Data {
         try imageIOData(

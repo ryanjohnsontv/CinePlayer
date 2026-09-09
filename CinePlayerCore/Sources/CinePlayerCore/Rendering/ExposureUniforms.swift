@@ -213,7 +213,15 @@ enum CalibrationPlausibility {
     /// noise floor (at/near `blackLevel`) — see `clippingMargin` — before
     /// black-level subtraction, since that's the domain `blackLevel`/
     /// `whiteLevel` are themselves defined in.
-    static func nativeChannelAverages(frame: DecodedFrame, cfaPhase: CFAPhase, blackLevel: Float, whiteLevel: Float) -> (r: Float, g: Float, b: Float, degenerateFraction: Float) {
+    /// `nativeChannelAverages`'s return value.
+    struct NativeChannelAverages {
+        let r: Float
+        let g: Float
+        let b: Float
+        let degenerateFraction: Float
+    }
+
+    static func nativeChannelAverages(frame: DecodedFrame, cfaPhase: CFAPhase, blackLevel: Float, whiteLevel: Float) -> NativeChannelAverages {
         let redOffset = cfaPhase.redOffset
         let redX = Int(redOffset.x), redY = Int(redOffset.y)
         let blueX = 1 - redX, blueY = 1 - redY
@@ -272,7 +280,7 @@ enum CalibrationPlausibility {
         let g = countG > 0 ? Float(sumG / Double(countG) - bl) : 0
         let b = countB > 0 ? Float(sumB / Double(countB) - bl) : 0
         let degenerateFraction = totalCount > 0 ? Float(degenerateCount) / Float(totalCount) : 0
-        return (r, g, b, degenerateFraction)
+        return NativeChannelAverages(r: r, g: g, b: b, degenerateFraction: degenerateFraction)
     }
 
     /// Max minus min of the 3 channels — 0 for a perfectly neutral triple,
@@ -301,6 +309,105 @@ enum CalibrationPlausibility {
         // no-op (spread(corrected) == uncorrectedSpread == 0) is a pass, not
         // a veto — `<` would wrongly veto that degenerate-but-correct case.
         return spread(corrected) <= uncorrectedSpread
+    }
+
+    /// Per-2x2-CFA-tile native (r, g, b) triples, sampled across the whole
+    /// frame on the same `stride`-spaced grid `nativeChannelAverages` uses
+    /// for its own frame-wide averages — kept as individual per-tile
+    /// triples here instead of collapsed into one aggregate, so a
+    /// candidate calibration's effect can be checked at each sampled
+    /// location independently. This is what `clippingFraction` needs to
+    /// catch a calibration that looks fine *on average* (passes
+    /// `isPlausible`) while still driving specific tonal regions into
+    /// negative — i.e. clamped-to-black, since `Tonemap.metal` clamps
+    /// every channel to `[0,1]` right after this stage — output. A real,
+    /// different blind spot from the one `isPlausible`'s own single
+    /// averaged-triple comparison has by construction.
+    static func nativeChannelTriples(frame: DecodedFrame, cfaPhase: CFAPhase, blackLevel: Float) -> [(r: Float, g: Float, b: Float)] {
+        let redOffset = cfaPhase.redOffset
+        let redX = Int(redOffset.x), redY = Int(redOffset.y)
+        let blueX = 1 - redX, blueY = 1 - redY
+
+        func sample(x: Int, y: Int) -> UInt16? {
+            guard x < frame.width, y < frame.height else { return nil }
+            return frame.pixels[y * frame.width + x]
+        }
+
+        var triples: [(r: Float, g: Float, b: Float)] = []
+        var y = 0
+        while y < frame.height {
+            var x = 0
+            while x < frame.width {
+                var r: UInt16?
+                var b: UInt16?
+                var gSum = 0.0
+                var gCount = 0
+                for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
+                    guard let raw = sample(x: x + dx, y: y + dy) else { continue }
+                    if dx == redX && dy == redY {
+                        r = raw
+                    } else if dx == blueX && dy == blueY {
+                        b = raw
+                    } else {
+                        gSum += Double(raw)
+                        gCount += 1
+                    }
+                }
+                if let r, let b, gCount > 0 {
+                    let bl = Double(blackLevel)
+                    triples.append((
+                        r: Float(Double(r) - bl),
+                        g: Float(gSum / Double(gCount) - bl),
+                        b: Float(Double(b) - bl)
+                    ))
+                }
+                x += stride
+            }
+            y += stride
+        }
+        return triples
+    }
+
+    /// The fraction of `triples` (at or above which) `vetoedCalibration`
+    /// treats `calibration` as unreliable even though it already passed
+    /// `isPlausible`'s frame-average check — chosen well above the low
+    /// single-digit percentage of samples ordinary sensor noise can push
+    /// slightly negative even for a genuinely correct calibration (a
+    /// near-black region, near the clipping margin already), comfortably
+    /// below the ~9%+ observed on a real file whose recorded calibration
+    /// was independently confirmed bad (its own `WBGain` disagreeing with
+    /// decomposing its own `cmCalib` — see `ColorCalibration`'s own doc
+    /// comment on that pattern).
+    private static let clippingFractionThreshold: Float = 0.05
+
+    /// Whether `calibration` would push at least one output channel
+    /// negative — i.e. clamped to black by `Tonemap.metal` right after
+    /// this stage — for `triple`.
+    private static func clips(_ calibration: ColorCalibration, _ triple: (r: Float, g: Float, b: Float)) -> Bool {
+        let wb = (
+            triple.r * calibration.whiteBalanceR,
+            triple.g * calibration.whiteBalanceG,
+            triple.b * calibration.whiteBalanceB
+        )
+        let m = calibration.matrix
+        let r = m[0] * wb.0 + m[1] * wb.1 + m[2] * wb.2
+        let g = m[3] * wb.0 + m[4] * wb.1 + m[5] * wb.2
+        let b = m[6] * wb.0 + m[7] * wb.1 + m[8] * wb.2
+        return r < 0 || g < 0 || b < 0
+    }
+
+    /// Fraction of `triples` that `clips(_:_:)` for `calibration` — the
+    /// per-location counterpart to `isPlausible`'s own frame-average
+    /// comparison. A calibration that's actually a valid correction for
+    /// its own footage should push at most a handful of already-near-black
+    /// samples slightly negative from ordinary sensor noise, not a
+    /// substantial fraction of the whole frame.
+    static func clippingFraction(_ calibration: ColorCalibration, for triples: [(r: Float, g: Float, b: Float)]) -> Float {
+        guard !triples.isEmpty else { return 0 }
+        let clippedCount = triples.reduce(into: 0) { count, triple in
+            if clips(calibration, triple) { count += 1 }
+        }
+        return Float(clippedCount) / Float(triples.count)
     }
 
     /// A generic, scene-independent fallback calibration — used instead of
@@ -339,6 +446,26 @@ enum CalibrationPlausibility {
     /// sensors/scenes — a real, tested improvement over showing zero color
     /// correction, not a claimed universal calibration. Revisit if it's
     /// ever shown to look worse than identity on other real footage.
+    ///
+    /// **Known stale, unresolved**: this was fit directly against
+    /// gamma-encoded (display-referred) pixel values rather than true
+    /// linear camera-native RGB — the same domain mismatch later found and
+    /// fixed for `veoFallback` (see that constant's own doc comment), which
+    /// also motivated isolating `blackLevel` from `applyColorMatrix` in
+    /// `Tonemap.metal` so the matrix never has to satisfy an implicit
+    /// row-sum-equals-1 constraint. This fallback's own row sums (~0.86)
+    /// don't satisfy that either, so its rendered behavior already shifted
+    /// once when that shader fix landed — and, if the camera this was fit
+    /// from also shot P10-packed footage (unconfirmed either way), shifted
+    /// again when CineKit 0.1.1 started delinearizing P10 pixel data at
+    /// decode time (see `veoFallback`'s own doc comment for that fix).
+    /// Direction and magnitude unverified either time, since redoing this
+    /// fit needs the original reference file/Resolve export (pavement/
+    /// fence/sky/skin scene, frame 0) that this project no longer has
+    /// access to. Revisit with the same rigor `veoFallback` got (fit in the
+    /// correct linear domain, validated against direct pixel-patch
+    /// comparison, not just an aggregate error metric) once that reference
+    /// material is available again.
     private static let genericFallback = ColorCalibration(
         whiteBalanceR: 0.7468678858351011,
         whiteBalanceG: 0.5895917817539703,
@@ -350,20 +477,129 @@ enum CalibrationPlausibility {
         ]
     )
 
-    /// `calibration`, or `Self.genericFallback` if applying it to `frame`'s
-    /// own bulk statistics fails the plausibility check above — the single
-    /// shared veto decision both `ExposureUniforms.init(setup:frame:
-    /// debayerMode:)` (used by `cine-diagnostic`) and `CineDocumentModel.
-    /// open(url:)` (the live app) apply, so the two can never drift out of
-    /// sync with each other. Skips the frame scan entirely for an
-    /// already-identity `calibration` (identity is trivially its own no-op
-    /// fixed point, so it can never fail the check, and a file with no
-    /// recorded calibration at all has no generic fallback to reach for
-    /// either — this only replaces a *specifically distrusted* recorded
-    /// calibration, not a genuinely absent one) — purely a cost saving, not
-    /// a behavior difference.
+    /// A VEO-family fallback for a specific Phantom camera hardware
+    /// revision, identified by `CineSetup.cameraVersion` — Vision
+    /// Research's own documented "version of camera hardware" field (per
+    /// its official Phantom Cine File Format spec), distinct from
+    /// `CineSetup.serial` (which identifies one specific physical unit,
+    /// not the model/hardware revision it is) and from `cameraModel` (a
+    /// human-readable name string that's absent on every VEO-family file
+    /// seen so far — `cameraVersion` is the only reliable, model-level
+    /// identifier available). Exists as its own fallback, distinct from
+    /// `genericFallback` above, because this hardware revision's own
+    /// `cmCalib` fails both plausibility checks below in a way clearly
+    /// specific to its own sensor: applying it drives ~9% of sampled
+    /// locations on frame 0 alone into a negative (clamped-to-black)
+    /// channel, and even where it doesn't outright clip, it's measurably
+    /// *farther* from a real DaVinci Resolve reference render of this
+    /// camera's own footage than doing nothing at all (`.identity`) — a
+    /// one-size-fits-all fallback derived from a different, unrelated
+    /// Phantom hardware revision's footage (`genericFallback`) has no
+    /// particular reason to correct for that either, and empirically does
+    /// about as poorly as `.identity` here.
     ///
-    /// Also skips the plausibility check itself — trusting `calibration`
+    /// Derived like `genericFallback` — a diagonal white-balance gain via
+    /// through-origin least squares, then a ridge-regularized residual 3x3
+    /// matrix — but critically, fit in the correct domain on both sides: true
+    /// *linear* camera-native RGB (this camera's own raw sensor signal,
+    /// demosaiced, identity-calibrated, with the real Rec.709 OETF
+    /// *inverted* back out, and — since CineKit 0.1.1 — P10's own
+    /// gamma-compander already undone at decode time by `CineFile
+    /// .effectiveBlackWhiteLevels`/`P10Unpacker`) against a real DaVinci
+    /// Resolve reference render's own linear scene values (its export also
+    /// OETF-inverted). Two earlier versions of this fallback each had a
+    /// real, independent domain bug, found and fixed in turn: fitting
+    /// directly against gamma-encoded pixel values (skipping the OETF
+    /// inversion) produced a matrix whose rows summed to ~0.6-0.73 instead
+    /// of ~1 and looked badly washed out/desaturated despite a
+    /// superficially-improved MAE; separately, fitting against CineKit
+    /// <0.1.1's still-P10-companded "raw" pixels (a bug in CineKit itself,
+    /// not this package) meant every fit before that point was quietly
+    /// working with gamma-encoded input on the camera-native side even once
+    /// the display side was correctly linearized. Sampled on a dense,
+    /// uniformly-spaced grid (24px stride) across 3 frames of a real
+    /// high-speed-video shoot of this camera's own footage (not hand-picked
+    /// regions of one still frame).
+    ///
+    /// **Validated on a held-out frame the fit never saw** (frame 450,
+    /// versus fit frames 50/150/300): mean absolute error against the
+    /// Resolve reference (display domain, 0-255) is 6.1, versus 21.4 for
+    /// `.identity` — a ~71% reduction. Performance on the fit frames (5.9)
+    /// is close enough to the held-out result that this isn't overfitting
+    /// to the 3 fit frames. Direct pixel-patch comparison against the real
+    /// Resolve reference (not just the aggregate MAE) confirms this: every
+    /// sampled patch — including green foliage, the hardest-to-match region
+    /// under both earlier, domain-buggy fits (off by 20-50+ per channel) —
+    /// matches within roughly 1-10 per channel, and a near-black patch
+    /// matches within ~0.3.
+    ///
+    /// **Caveat, stated plainly**: fit from footage of ONE camera hardware
+    /// revision under the lighting/exposure of one shoot, and keyed by
+    /// `cameraVersion` rather than `serial` specifically so this applies to
+    /// every physical unit of that same hardware revision, not just the
+    /// one this was fit against — but it's still not independently
+    /// verified across other units or lighting conditions. A real, measured
+    /// improvement over the alternatives on this hardware revision's real
+    /// footage, not a claimed universal or physically-exact color-science
+    /// match. Revisit if it's ever shown to look worse than `.identity` on
+    /// other real footage from the same hardware revision.
+    private static let veoFallback = ColorCalibration(
+        whiteBalanceR: 2.0308789512110796,
+        whiteBalanceG: 0.9099304067476847,
+        whiteBalanceB: 1.4673041969484928,
+        matrix: [
+            1.000192723667483, 0.0007430503053335955, -0.001199720125065869,
+            -0.002204117987742132, 0.9985447050892037, 0.006007552953927219,
+            -0.003647393783310004, -0.0020861312597412886, 1.003340758888242,
+        ]
+    )
+
+    /// A known-bad-`cmCalib` Phantom hardware revision this project has a
+    /// dedicated, validated fallback for — see `veoFallback`'s own doc
+    /// comment. Matched by `CineSetup.cameraVersion` (Vision Research's
+    /// documented "version of camera hardware" field), not `serial`, so
+    /// this generalizes to every physical unit of that hardware revision
+    /// automatically rather than naming one specific camera.
+    private static let veoCameraVersion: UInt32 = 7011
+
+    /// The fallback to use for a vetoed calibration on a file identified
+    /// by `cameraVersion` — `veoFallback` for `veoCameraVersion`,
+    /// `genericFallback` (fit from a different camera hardware revision
+    /// entirely) for everything else. A one-size-fits-all fallback derived
+    /// from one specific hardware revision's footage has no reason to suit
+    /// a different physical camera/sensor — see `veoFallback`'s own doc
+    /// comment.
+    private static func fallback(forCameraVersion cameraVersion: UInt32?) -> ColorCalibration {
+        switch cameraVersion {
+        case veoCameraVersion: return veoFallback
+        default: return genericFallback
+        }
+    }
+
+    /// `calibration`, or a per-camera fallback (see
+    /// `fallback(forCameraVersion:)`) if applying it to `frame`'s own bulk
+    /// statistics fails either
+    /// plausibility check below — the single shared veto decision both
+    /// `ExposureUniforms.init(cineFile:frame:debayerMode:lutEnabled:)` (used
+    /// by `cine-diagnostic`) and `CineDocumentModel.open(url:)` (the live
+    /// app) apply, so the two can never drift out of sync with each
+    /// other. Skips the frame scan entirely for an already-identity
+    /// `calibration` (identity is trivially its own no-op fixed point, so
+    /// it can never fail either check, and a file with no recorded
+    /// calibration at all has no generic fallback to reach for either —
+    /// this only replaces a *specifically distrusted* recorded
+    /// calibration, not a genuinely absent one) — purely a cost saving,
+    /// not a behavior difference.
+    ///
+    /// Two independent checks, either of which can veto: `isPlausible`
+    /// (does this calibration move the frame's *average* statistics
+    /// toward neutral) and `clippingFraction` (does it also avoid driving
+    /// a substantial fraction of individual sampled locations negative) —
+    /// see that function's own doc comment for why the first, coarser
+    /// check alone isn't sufficient; a calibration can pass on average
+    /// while still clipping specific tonal regions hard.
+    ///
+    /// Also skips both plausibility checks — trusting `calibration`
     /// rather than measuring against it — when `nativeChannelAverages`
     /// reports too much of the frame is clipped or at the noise floor to
     /// give the gray-world comparison anything real to measure (see
@@ -374,12 +610,16 @@ enum CalibrationPlausibility {
         frame: DecodedFrame,
         cfaPhase: CFAPhase,
         blackLevel: Float,
-        whiteLevel: Float
+        whiteLevel: Float,
+        cameraVersion: UInt32? = nil
     ) -> ColorCalibration {
         guard calibration != .identity else { return calibration }
         let native = nativeChannelAverages(frame: frame, cfaPhase: cfaPhase, blackLevel: blackLevel, whiteLevel: whiteLevel)
         guard native.degenerateFraction < degenerateFractionThreshold else { return calibration }
-        return isPlausible(calibration, for: (native.r, native.g, native.b)) ? calibration : genericFallback
+        guard isPlausible(calibration, for: (native.r, native.g, native.b)) else { return fallback(forCameraVersion: cameraVersion) }
+        let triples = nativeChannelTriples(frame: frame, cfaPhase: cfaPhase, blackLevel: blackLevel)
+        guard clippingFraction(calibration, for: triples) < clippingFractionThreshold else { return fallback(forCameraVersion: cameraVersion) }
+        return calibration
     }
 }
 
@@ -479,24 +719,33 @@ public struct ExposureUniforms: Equatable {
     }
 
     /// Derives the black/white points, CFA phase, and color calibration
-    /// from the file's `setup` block and carries forward
-    /// `frame.needsVerticalFlip` — the one place this mapping is defined,
-    /// so the GUI app and `cine-diagnostic` can't drift out of sync with
-    /// each other.
+    /// from `cineFile` and carries forward `frame.needsVerticalFlip` — the
+    /// one place this mapping is defined, so the GUI app and
+    /// `cine-diagnostic` can't drift out of sync with each other.
+    ///
+    /// Takes the whole `CineFile`, not just `cineFile.setup`, specifically
+    /// so `CineFile.effectiveBlackWhiteLevels` (not `CineSetup`'s own,
+    /// lower-level property of nearly the same name) is what supplies the
+    /// black/white points here — see that property's own doc comment for
+    /// why a P10-packed file's `SETUP.BlackLevel`/`WhiteLevel` alone aren't
+    /// the right numbers to tone-map `frame`'s actual (now-linearized)
+    /// pixel data against.
     public init(
-        setup: CineSetup,
+        cineFile: CineFile,
         frame: DecodedFrame,
         debayerMode: DebayerMode = .rawSensor,
         lutEnabled: Bool = false
     ) {
-        let levels = setup.effectiveBlackWhiteLevels
+        let setup = cineFile.setup
+        let levels = cineFile.effectiveBlackWhiteLevels
         let cfaPhase = CFAPhase.forCFAPattern(setup.cfa)
         let calibration = CalibrationPlausibility.vetoedCalibration(
             setup.colorCalibration ?? .identity,
             frame: frame,
             cfaPhase: cfaPhase,
             blackLevel: Float(levels.black),
-            whiteLevel: Float(levels.white)
+            whiteLevel: Float(levels.white),
+            cameraVersion: setup.cameraVersion
         )
         self.init(
             blackLevel: Float(levels.black),

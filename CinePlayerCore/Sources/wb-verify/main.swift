@@ -7,7 +7,7 @@ import CinePlayerCore
 // for each real sample .cine file, open it through the REAL, post-task
 // CineDocumentModel.open(url:) public API (colorTempKelvin/wbcc at their
 // defaults, 6500/0), and compare the resulting uniforms.wbGainR/G/B/
-// colorMatrix against the UNMODIFIED ExposureUniforms(setup:frame:
+// colorMatrix against the UNMODIFIED ExposureUniforms(cineFile:frame:
 // debayerMode:) convenience init (verified via `git diff --exit-code` to
 // be byte-identical to pre-task source), which is the same "old code path"
 // cine-diagnostic itself already used before this task existed.
@@ -30,7 +30,7 @@ for path in paths {
     // Old/reference path: exactly what cine-diagnostic has always used.
     let cineFile = try CineFile(url: url)
     let frame = try cineFile.decodeFrame(at: 0)
-    let refUniforms = ExposureUniforms(setup: cineFile.setup, frame: frame, debayerMode: .bilinear)
+    let refUniforms = ExposureUniforms(cineFile: cineFile, frame: frame, debayerMode: .bilinear)
 
     // New path: the real, post-task CineDocumentModel public API, defaults untouched.
     let model = CineDocumentModel(device: device)
